@@ -69,7 +69,7 @@ def color_for(score, status=""):
     if "재확인" in status:
         return STALE              # 오래된 근거 / 수거 후 미확인 · 재확인 필요 (회보라)
     if score is None or pd.isna(score):
-        return "#B8C2CC"          # 미측정
+        return "#B8C2CC"          # 확인 기록 없음
     if score >= 4.5:
         return "#D64545"          # 높음
     if score >= 3:
@@ -98,6 +98,18 @@ if "cleanups" not in st.session_state:         # 수거 완료 기록
 
 def save_cleanups():
     CLEANUPS_FILE.write_text(json.dumps(st.session_state.cleanups, ensure_ascii=False), encoding="utf-8")
+
+
+PATROLS_FILE = BASE / "patrols.json"
+if "patrols" not in st.session_state:          # 순찰 확인(이상 없음) 기록
+    try:
+        st.session_state.patrols = json.loads(PATROLS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st.session_state.patrols = []
+
+
+def save_patrols():
+    PATROLS_FILE.write_text(json.dumps(st.session_state.patrols, ensure_ascii=False), encoding="utf-8")
 
 
 TODAY = datetime.now().date()
@@ -135,7 +147,8 @@ table = core.build_table(beaches, st.session_state.reports, winter, records,
                          today=TODAY, cleanups=st.session_state.cleanups)
 
 zones = load_zones()
-cov = core.zone_coverage(table, zones, winter, today=TODAY) if zones else None
+cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
+                          patrols=st.session_state.patrols) if zones else None)
 
 tab_map, tab_report, tab_list, tab_check = st.tabs(
     ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
@@ -162,7 +175,7 @@ with tab_map:
     c2.metric("최근 근거 지점", int((table.status == "최근 근거").sum()))
     c3.metric("재확인 필요", int(table.status.str.contains("재확인").sum()))
     c4.metric("수거 완료", int((table.status == "수거 완료").sum()))
-    c5.metric("미측정", int((table.status == "미측정").sum()))
+    c5.metric("확인 기록 없음", int((table.status == core.NO_CHECK).sum()))
     st.caption(f"근거: 공공 조사(2021) {int(beaches.hazard_index.notna().sum())}곳 · 기관·언론 기록 {len(records)}건 · "
                f"시민 제보 {len(st.session_state.reports)}건 · 기준일 {TODAY:%Y-%m-%d}")
 
@@ -171,8 +184,8 @@ with tab_map:
         st.markdown("#### 🕳️ 해안 확인 공백: 제보가 없는 곳은 '깨끗한 곳'이 아니라 '모르는 곳'")
         z1, z2, z3, z4 = st.columns(4)
         z1.metric("해안 구역 (마을어장 지선)", f"{cs['total']}곳")
-        z2.metric(f"최근 {core.RECENT_CHECK_DAYS}일 안에 확인", f"{cs['최근 확인']}곳",
-                  f"{cs['최근 확인'] / cs['total'] * 100:.0f}%", delta_color="off")
+        z2.metric(f"최근 {core.RECENT_CHECK_DAYS}일 안에 확인",
+                  f"{cs['최근 확인']}곳 ({cs['최근 확인'] / cs['total'] * 100:.0f}%)")
         z3.metric("오래전 확인", f"{cs['오래전 확인']}곳")
         z4.metric("확인 기록 없음", f"{cs['확인 기록 없음']}곳")
         dall = cov[cov.dolphin >= 1.0]
@@ -207,7 +220,7 @@ with tab_map:
         if r.status == "수거 완료":
             size, src = 10, "#3BA272"
         tip = f"{r.name} · " + (f"✅ 수거 완료 ({r.last_cleanup})" if r.status == "수거 완료" else
-                                "미측정 (제보 필요)" if pd.isna(score) else
+                                "확인 기록 없음 (제보 필요)" if pd.isna(score) else
                                 f"위험 지수 {score:.2f} · 근거 {r.evidence}건 · {r.status}")
         pop = (f"<b>{r.name}</b> ({r.type})<br>"
                f"상태: <b>{r.status}</b>" + (f" (마지막 근거 {r.last_date})" if r.last_date else "")
@@ -225,11 +238,11 @@ with tab_map:
                             tooltip=tip, popup=folium.Popup(pop, max_width=280)).add_to(m)
     st_folium(m, height=520, use_container_width=True, returned_objects=[])
     st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · **회보라 오래된 근거(재확인 필요)** · "
-               "흰색 수거 완료 · 회색 미측정　| 크기: 근거 수　"
+               "흰색 수거 완료 · 회색 확인 기록 없음　| 크기: 근거 수　"
                "| 테두리: 파랑 공공 조사 · 청록 기관·언론 기록 · 주황 시민 제보 포함")
     if show_zones:
         st.caption("▭ 해안 구역(마을어장 지선): **빨간 점선 = 확인 기록 없음** · 보라 = 오래전 확인"
-                   f"({core.RECENT_CHECK_DAYS}일 넘음) · 초록 = 최근 확인. 확인 = 조사·기록·제보·수거 완료 중 하나라도 있었던 날. "
+                   f"({core.RECENT_CHECK_DAYS}일 넘음) · 초록 = 최근 확인. 확인 = 조사·기록·제보·수거 완료·순찰(이상 없음) 중 하나라도 있었던 날. "
                    "출처: 해양수산부 국립해양조사원 어장정보도(마을어업), 추자도 제외")
 
     st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
@@ -393,6 +406,34 @@ with tab_list:
         full.columns = ["해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "위도", "경도"]
         st.download_button(f"📥 확인 공백 구역 전체 {len(full)}곳 CSV", full.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"확인공백구역_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+
+        st.markdown("##### 🧭 순찰 확인 기록 (쓰레기 이상 없음)")
+        st.caption("순찰했는데 쓰레기가 거의 없었다면 여기서 기록하세요. 이 구역은 '최근 확인'으로 바뀌어 공백 목록에서 빠지고, "
+                   f"{core.RECENT_CHECK_DAYS}일이 지나면 다시 공백 목록에 올라옵니다. "
+                   "**쓰레기가 있었다면 '📸 쓰레기 제보' 탭에서 제보**해야 위험 순위에 반영됩니다.")
+        todo = list(cov[cov.state != "최근 확인"].zone)
+        if todo:
+            pz1, pz2, pz3 = st.columns([2, 2, 1])
+            pz = pz1.selectbox("순찰한 구역", todo, key="patrol_zone",
+                               format_func=lambda z: f"{z} ({cov.set_index('zone').at[z, 'emd']})")
+            pwho = pz2.text_input("순찰자 / 메모 (선택)", key="patrol_who", placeholder="예: 대정읍 지킴이, 해변 2km 도보")
+            pz3.write("")
+            if pz3.button("이상 없음 기록", use_container_width=True):
+                st.session_state.patrols.append({"zone": pz, "date": TODAY.isoformat(), "by": pwho,
+                                                 "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                save_patrols()
+                st.session_state.flash_patrol = f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
+                st.rerun()
+        if st.session_state.get("flash_patrol"):
+            st.success(st.session_state.pop("flash_patrol"))
+        if st.session_state.patrols:
+            plog = pd.DataFrame(st.session_state.patrols)[["date", "zone", "by", "logged"]]
+            plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "기록 시각"]
+            st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
+            if st.button("↩️ 마지막 순찰 기록 되돌리기"):
+                st.session_state.patrols.pop()
+                save_patrols()
+                st.rerun()
 
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
     if len(stale):

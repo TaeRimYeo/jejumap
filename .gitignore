@@ -4,3 +4,4 @@ reports.json
 cleanups.json
 __pycache__/
 *.zip
+patrols.json

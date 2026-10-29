@@ -107,8 +107,12 @@ for i in idx:
         rings.append([[round(lo, 5), round(la, 5)] for la, lo in simplify(ll)])
     rings.sort(key=len, reverse=True)
     emd = emd_for(r["addr"], r["sgg_nm"], lat_c)
+    name, k = r["addr"].strip(), 2
+    while any(f["properties"]["name"] == name for f in feats):   # 같은 이름의 다른 구역 (예: 비양도 지선 2곳)
+        name = f"{r['addr'].strip()} #{k}"
+        k += 1
     feats.append({"type": "Feature",
-                  "properties": {"zone_id": len(feats), "name": r["addr"].strip(), "sgg": r["sgg_nm"].replace("제주특별자치도 ", ""),
+                  "properties": {"zone_id": len(feats), "name": name, "sgg": r["sgg_nm"].replace("제주특별자치도 ", ""),
                                  "emd": emd, "lat": round(lat_c, 5), "lon": round(lon_c, 5),
                                  "area_ha": float(r["area"]), "license": r["lcns_no"]},
                   "geometry": {"type": "Polygon", "coordinates": rings}})

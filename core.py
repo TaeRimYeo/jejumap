@@ -32,6 +32,7 @@ PRIOR_K = 1.0
 HALF_LIFE_PUBLIC = 1095   # 3년
 HALF_LIFE_EVENT = 180     # 6개월
 PUBLIC_DATE = "2021-12-31"   # 2021년 연 6회 조사의 마지막 시점으로 잡음
+NO_CHECK = "확인 기록 없음"   # 근거가 하나도 없는 지점·구역 ('깨끗함'이 아님)
 SOURCE_LABEL = {"public": "공공 조사(2021)", "record": "기관·언론 기록(2025~26)", "report": "시민 제보"}
 
 
@@ -182,7 +183,9 @@ def build_structure(beaches, reports, records=None):
             near, dist = nearest_point(t, it["lat"], it["lon"])
             if dist <= ATTACH_M:
                 idx = near.name
-        e = {"source": it["source"], "category": it["category"], "date": it["date"], "at": it["at"]}
+        e = {"source": it["source"], "category": it["category"], "date": it["date"], "at": it["at"],
+             "lat": it.get("lat") if pd.notna(it.get("lat")) else None,
+             "lon": it.get("lon") if pd.notna(it.get("lon")) else None}
         if idx is not None:
             evid[idx].append(e)
         else:
@@ -253,7 +256,7 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
                 cols[k].append(float("nan"))
             cols["last_date"].append("")
             if cut is None:
-                cols["status"].append("미측정")
+                cols["status"].append(NO_CHECK)
             elif (today - cut.date()).days > w["hl_event"]:
                 cols["status"].append("수거 후 미확인 · 재확인 필요")   # 치운 지 오래됐는데 아무도 다시 안 봄
             else:
@@ -289,7 +292,7 @@ def build_table(beaches, reports, winter_on, records=None, w=None, today=None, c
 # ---------- 해안 구역(마을어장 지선) 단위 확인 공백 ----------
 ZONE_ATTACH_M = 1500      # 지점을 가장 가까운 구역에 붙이는 최대 거리
 RECENT_CHECK_DAYS = 180   # 이 기간 안에 근거·수거가 있으면 '최근 확인'
-ZONE_STATES = ("확인 기록 없음", "오래전 확인", "최근 확인")
+ZONE_STATES = (NO_CHECK, "오래전 확인", "최근 확인")
 
 
 def load_zones(path):
@@ -314,20 +317,40 @@ def dist_to_zone_m(lat, lon, rings):
     return 0.0 if inside else best
 
 
-def zone_coverage(table, zones, winter_on=False, w=None, today=None):
-    """구역마다 마지막으로 누군가 확인한 날(근거·수거)을 계산.
-    지점은 가장 가까운 구역 하나에 붙임(1.5km 이내). 제보가 없다는 건 '깨끗하다'가 아니라 '모른다'이므로
-    확인 기록 없음 / 오래전 확인을 따로 드러내고, 민감도(돌고래·겨울 북서풍) 높은 곳부터 순찰 순서를 매김."""
+def nearest_zone(zones, lat, lon, max_m=ZONE_ATTACH_M):
+    """가장 가까운 구역 번호(목록 순서). 너무 멀면 None."""
+    dm, i = min((dist_to_zone_m(lat, lon, z["geometry"]["coordinates"]), i) for i, z in enumerate(zones))
+    return i if dm <= max_m else None
+
+
+def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=None, patrols=None):
+    """구역마다 마지막으로 누군가 확인한 날을 계산. 확인 = 공공 조사·기관 기록·시민 제보·수거 완료·순찰(이상 없음).
+    근거는 자기 위치로 가장 가까운 구역(1.5km 이내)에 붙임. 위치가 없는 근거와 수거 완료는 지점 위치를 씀.
+    제보가 없다는 건 '깨끗하다'가 아니라 '모른다'이므로 확인 기록 없음 / 오래전 확인을 따로 드러내고,
+    민감도(돌고래·겨울 북서풍) 높은 곳부터 순찰 순서를 매김."""
     w = w or default_weights()
     today = _to_date(today) or _dt.date.today()
-    seen = {}
+    done = last_cleanups(cleanups)
+    seen, cache = {}, {}
+
+    def hit(lat, lon, d, label):
+        key = (round(lat, 5), round(lon, 5))
+        if key not in cache:
+            cache[key] = nearest_zone(zones, lat, lon)
+        if cache[key] is not None and d is not None:
+            seen.setdefault(cache[key], []).append((d, label))
+
     for r in table.itertuples():
-        if not r.last_seen:
-            continue
-        d = [(dist_to_zone_m(r.lat, r.lon, z["geometry"]["coordinates"]), i) for i, z in enumerate(zones)]
-        dm, i = min(d)
-        if dm <= ZONE_ATTACH_M:
-            seen.setdefault(i, []).append((_to_date(r.last_seen), r.name))
+        for e in getattr(r, "evid", None) or []:
+            lat, lon = (e.get("lat"), e.get("lon")) if e.get("lat") is not None else (r.lat, r.lon)
+            hit(lat, lon, e["date"], r.name)
+        if r.name in done:
+            hit(r.lat, r.lon, done[r.name].date(), r.name + "(수거)")
+    by_name = {z["properties"]["name"]: i for i, z in enumerate(zones)}
+    for p in patrols or []:
+        i = by_name.get(p.get("zone"))
+        if i is not None:
+            seen.setdefault(i, []).append((_to_date(p["date"]), "순찰"))
     out = []
     for i, z in enumerate(zones):
         p = z["properties"]
@@ -345,8 +368,8 @@ def zone_coverage(table, zones, winter_on=False, w=None, today=None):
     order = {s: k for k, s in enumerate(ZONE_STATES)}
     df["_o"] = df.state.map(order)
     df["_d"] = df.days_since.fillna(10 ** 6)
-    df = df.sort_values(["_o", "sensitivity", "_d"], ascending=[True, False, False]).drop(columns=["_o", "_d"])
-    return df.reset_index(drop=True)
+    df = df.sort_values(["_o", "sensitivity", "_d", "zone"], ascending=[True, False, False, True])
+    return df.drop(columns=["_o", "_d"]).reset_index(drop=True)
 
 
 def coverage_summary(cov):
