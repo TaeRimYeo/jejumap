@@ -43,11 +43,19 @@ def load_records_df():
 
 
 @st.cache_data(show_spinner="가중치 조합 수백 개로 다시 계산 중... (처음 한 번만 걸려요)")
-def cached_robustness(reports_json, winter_on):
-    return core.robustness(load_beaches(), json.loads(reports_json), load_records_df().to_dict("records"), winter_on)
+def cached_robustness(reports_json, cleanups_json, winter_on, today):
+    return core.robustness(load_beaches(), json.loads(reports_json), load_records_df().to_dict("records"), winter_on,
+                           today=today, cleanups=json.loads(cleanups_json))
 
 
-def color_for(score):
+STALE, DONE = "#A99BC9", "#FFFFFF"
+
+
+def color_for(score, status=""):
+    if status == "수거 완료":
+        return DONE               # 수거 완료 (흰색)
+    if status.startswith("오래된"):
+        return STALE              # 오래된 근거 · 재확인 필요 (회보라)
     if score is None or pd.isna(score):
         return "#B8C2CC"          # 미측정
     if score >= 4.5:
@@ -68,6 +76,19 @@ if "reports" not in st.session_state:          # 앱을 껐다 켜도 제보 유
         st.session_state.reports = []
 if "stamps" not in st.session_state:
     st.session_state.stamps = set()
+CLEANUPS_FILE = BASE / "cleanups.json"
+if "cleanups" not in st.session_state:         # 수거 완료 기록
+    try:
+        st.session_state.cleanups = json.loads(CLEANUPS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        st.session_state.cleanups = []
+
+
+def save_cleanups():
+    CLEANUPS_FILE.write_text(json.dumps(st.session_state.cleanups, ensure_ascii=False), encoding="utf-8")
+
+
+TODAY = datetime.now().date()
 
 # ---------------- 사이드바 ----------------
 with st.sidebar:
@@ -88,15 +109,18 @@ with st.sidebar:
     else:
         st.caption("AI 키가 없어요. 제보 화면에서 종류를 직접 고르면 됩니다.")
     st.divider()
-    st.markdown("**위험 지수**  \n= 보정 위해성 × (1+돌고래) × 마을어장 × 계절  \n"
+    st.markdown("**현재 위험 지수**  \n= 보정 위해성 × (1+돌고래) × 마을어장 × 계절 × **최신성**  \n"
                 "**보정 위해성** = (근거 위해성 합 + 2) ÷ (근거 수 + 1)  \n"
                 "**근거 수** = 공공 조사 + 기관·언론 기록 + 시민 제보")
+    st.caption(f"최신성: 근거가 오래될수록 가볍게 반영 (반감기 공공 조사 {core.HALF_LIFE_PUBLIC // 365}년, "
+               f"기록·제보 {core.HALF_LIFE_EVENT}일). **수거 완료** 처리하면 그 전 근거는 빠집니다.")
     st.caption("근거가 1건뿐인 곳은 중간값(2)과 반반 섞어서, 제보 한 건으로 순위가 튀지 않게 합니다.")
     st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1 "
                "(버려진 어구 = 해양생물 위협 1위, Wilcox 외 2016)\n\n"
                "돌고래: 대정 1.0(2025 보호구역) · 안덕·구좌 0.5(2026 보도)")
 
-table = core.build_table(beaches, st.session_state.reports, winter, records)
+table = core.build_table(beaches, st.session_state.reports, winter, records,
+                         today=TODAY, cleanups=st.session_state.cleanups)
 
 tab_map, tab_report, tab_list, tab_check = st.tabs(
     ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
@@ -120,19 +144,28 @@ with tab_map:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("지도 지점", len(table))
-    c2.metric("공공 조사 (2021)", int(table.public_evidence.sum()))
-    c3.metric("기관·언론 기록 (2025–26)", len(records))
-    c4.metric("시민 제보", len(st.session_state.reports))
-    c5.metric("미측정 지점", int(table.risk_index.isna().sum()))
+    c2.metric("최근 근거 지점", int((table.status == "최근 근거").sum()))
+    c3.metric("재확인 필요", int(table.status.str.startswith("오래된").sum()))
+    c4.metric("수거 완료", int((table.status == "수거 완료").sum()))
+    c5.metric("미측정", int((table.status == "미측정").sum()))
+    st.caption(f"근거: 공공 조사(2021) {int(beaches.hazard_index.notna().sum())}곳 · 기관·언론 기록 {len(records)}건 · "
+               f"시민 제보 {len(st.session_state.reports)}건 · 기준일 {TODAY:%Y-%m-%d}")
 
     m = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap")
     for r in table.itertuples():
         src = ORANGE if r.report_count else (TEAL if r.record_count else BLUE)
         score = r.risk_index
         size = 7 if pd.isna(score) else min(24, 9 + 3 * r.evidence)
-        tip = f"{r.name} · " + ("미측정 (제보 필요)" if pd.isna(score) else f"위험 지수 {score:.2f} · 근거 {r.evidence}건")
+        if r.status == "수거 완료":
+            size, src = 10, "#3BA272"
+        tip = f"{r.name} · " + (f"✅ 수거 완료 ({r.last_cleanup})" if r.status == "수거 완료" else
+                                "미측정 (제보 필요)" if pd.isna(score) else
+                                f"위험 지수 {score:.2f} · 근거 {r.evidence}건 · {r.status}")
         pop = (f"<b>{r.name}</b> ({r.type})<br>"
-               f"위험 지수: {'미측정' if pd.isna(score) else f'{score:.2f}'}<br>"
+               f"상태: <b>{r.status}</b>" + (f" (마지막 근거 {r.last_date})" if r.last_date else "")
+               + (f"<br>마지막 수거 완료: {r.last_cleanup}" if r.last_cleanup else "") + "<br>"
+               f"위험 지수: {'-' if pd.isna(score) else f'{score:.2f}'}"
+               f"{'' if pd.isna(r.freshness) else f' (최신성 {r.freshness:.2f})'}<br>"
                f"보정 위해성: {'-' if pd.isna(r.adj_hazard) else f'{r.adj_hazard:.2f}'}"
                f" (원래 {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'})<br>"
                f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}<br>"
@@ -140,19 +173,24 @@ with tab_map:
                f"돌고래 가중치: {r.dolphin_weight}"
                + (f" ({r.dolphin_basis})" if isinstance(r.dolphin_basis, str) and r.dolphin_basis else ""))
         folium.CircleMarker([r.lat, r.lon], radius=size, color=src, weight=3,
-                            fill=True, fill_color=color_for(score), fill_opacity=0.85,
+                            fill=True, fill_color=color_for(score, r.status), fill_opacity=0.85,
                             tooltip=tip, popup=folium.Popup(pop, max_width=280)).add_to(m)
     st_folium(m, height=520, use_container_width=True, returned_objects=[])
-    st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · 회색 미측정　"
-               "| 크기: 근거 수　| 테두리: 파랑 공공 조사 · 초록 기관·언론 기록 · 주황 시민 제보 포함")
+    st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · **회보라 오래된 근거(재확인 필요)** · "
+               "흰색 수거 완료 · 회색 미측정　| 크기: 근거 수　"
+               "| 테두리: 파랑 공공 조사 · 청록 기관·언론 기록 · 주황 시민 제보 포함")
 
     st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
     live = core.priority(table, n=len(table))
     live = live.assign(순위=range(1, len(live) + 1))[
-        ["순위", "name", "emd", "risk_index", "public_evidence", "record_count", "report_count", "evidence"]]
-    live.columns = ["순위", "지점", "읍면동", "위험 지수", "공공 조사", "기관 기록", "시민 제보", "근거 수"]
+        ["순위", "name", "emd", "risk_index", "status", "last_date", "freshness",
+         "public_evidence", "record_count", "report_count", "evidence"]]
+    live["freshness"] = live["freshness"].round(2)
+    live.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "마지막 근거", "최신성",
+                    "공공 조사", "기관 기록", "시민 제보", "근거 수"]
     st.dataframe(live, hide_index=True, use_container_width=True)
-    st.caption(f"제보가 들어올 때마다 바뀝니다. 아직 근거가 없는 지점 {int(table.risk_index.isna().sum())}곳은 순위에서 빠져 있어요.")
+    st.caption("제보가 들어오면 올라가고, 시간이 지나거나 수거 완료 처리하면 내려갑니다. "
+               "'재확인 필요'는 쓰레기가 없다는 뜻이 아니라 최근에 확인한 사람이 없다는 뜻이에요.")
 
     if len(records_df):
         st.markdown("#### 🗂️ 기관·언론 정화 기록 (2025–2026)")
@@ -232,7 +270,8 @@ with tab_report:
             st.session_state.stamps.add(place)
             st.session_state.pop("ai", None)
             REPORTS_FILE.write_text(json.dumps(st.session_state.reports, ensure_ascii=False), encoding="utf-8")
-            new = core.build_table(beaches, st.session_state.reports, winter, records)
+            new = core.build_table(beaches, st.session_state.reports, winter, records,
+                                   today=TODAY, cleanups=st.session_state.cleanups)
             after = new[new.name == place].iloc[0]
             st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {after.risk_index:.2f} · "
                                       f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요.")
@@ -258,6 +297,43 @@ with tab_list:
     st.download_button("📥 지킴이 전달용 CSV 다운로드", rep.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"우선수거구역_{datetime.now():%Y%m%d}.csv", mime="text/csv")
 
+    st.divider()
+    st.markdown("#### ✅ 수거 완료 처리")
+    st.caption("지킴이가 수거를 마친 지점을 완료 처리하면, 그 전까지의 근거는 점수에서 빠지고 지도에 흰색으로 표시됩니다. "
+               "이후 새 제보가 들어오면 다시 순위에 올라옵니다.")
+    open_sites = list(core.priority(table, n=len(table)).name)
+    if open_sites:
+        cc1, cc2, cc3 = st.columns([2, 2, 1])
+        site = cc1.selectbox("완료할 지점", open_sites, key="cleanup_site")
+        who = cc2.text_input("처리자 / 메모 (선택)", key="cleanup_who", placeholder="예: 안덕면 바다환경지킴이 2명")
+        cc3.write("")
+        if cc3.button("수거 완료", type="primary", use_container_width=True):
+            st.session_state.cleanups.append({"site": site, "date": TODAY.isoformat(), "by": who,
+                                              "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
+            save_cleanups()
+            st.session_state.flash_clean = f"✅ **{site}** 수거 완료 처리됨. 지도와 순위에서 내려갔어요."
+            st.rerun()
+    if st.session_state.get("flash_clean"):
+        st.success(st.session_state.pop("flash_clean"))
+    if st.session_state.cleanups:
+        log = pd.DataFrame(st.session_state.cleanups)[["date", "site", "by", "logged"]]
+        log.columns = ["완료일", "지점", "처리자/메모", "기록 시각"]
+        st.dataframe(log.iloc[::-1], hide_index=True, use_container_width=True)
+        if st.button("↩️ 마지막 완료 처리 되돌리기"):
+            st.session_state.cleanups.pop()
+            save_cleanups()
+            st.rerun()
+
+    stale = table[table.status.str.startswith("오래된")].sort_values("last_date")
+    if len(stale):
+        st.divider()
+        st.markdown("#### 🔎 순찰 권장 (오래 확인되지 않은 해안)")
+        sv = stale[["name", "emd", "last_date", "freshness", "evidence"]].copy()
+        sv["freshness"] = sv["freshness"].round(2)
+        sv.columns = ["지점", "읍면동", "마지막 근거", "최신성", "근거 수"]
+        st.dataframe(sv, hide_index=True, use_container_width=True)
+        st.caption("예전엔 쓰레기가 확인됐지만 최근 근거가 없는 곳입니다. 깨끗해졌는지, 아무도 안 가 봤는지 모르니 순찰로 확인하세요.")
+
     if st.session_state.reports:
         st.markdown("#### 제보 기록")
         st.dataframe(pd.DataFrame(st.session_state.reports)[["time", "place", "emd", "category", "ai"]],
@@ -276,10 +352,12 @@ with tab_check:
         ds = st.slider("돌고래 가중치 배율 (0 = 돌고래 무시)", 0.0, 2.0, 1.0, 0.25)
         fi = st.slider("마을어장 인접 배율", 1.0, 2.0, core.FISHERY_W, 0.25)
         kk = st.slider("근거 수 보정 강도 (0 = 보정 없음)", 0.0, 3.0, core.PRIOR_K, 0.5)
+        hl = st.slider("기록·제보 반감기 (일)", 30, 720, core.HALF_LIFE_EVENT, 30)
     w = core.default_weights()
     w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl, seaweed=ot, other=ot)
-    w.update(dolphin_scale=ds, fishery=fi, prior_k=kk)
-    custom = core.build_table(beaches, st.session_state.reports, winter, records, w)
+    w.update(dolphin_scale=ds, fishery=fi, prior_k=kk, hl_event=hl)
+    custom = core.build_table(beaches, st.session_state.reports, winter, records, w,
+                              today=TODAY, cleanups=st.session_state.cleanups)
     base_t = table[table.risk_index.notna()].set_index("name")
     cus_t = custom[custom.risk_index.notna()].set_index("name")
     base_r = base_t.risk_index.rank(ascending=False, method="min").astype(int)
@@ -292,7 +370,8 @@ with tab_check:
 
     st.divider()
     st.markdown("#### 자동 민감도 분석")
-    rb, summ = cached_robustness(json.dumps(st.session_state.reports, ensure_ascii=False), winter)
+    rb, summ = cached_robustness(json.dumps(st.session_state.reports, ensure_ascii=False),
+                                 json.dumps(st.session_state.cleanups, ensure_ascii=False), winter, TODAY.isoformat())
     m1, m2, m3 = st.columns(3)
     m1.metric("시험한 가중치 조합", f"{summ['scenarios']}개")
     m2.metric("기본 순위와 평균 순위상관", f"{summ['rho_mean']:.2f}")
@@ -301,8 +380,8 @@ with tab_check:
     st.caption("폐어구 2–5, 플라스틱·스티로폼 1.5–2.5, 돌고래 배율 0–1.5, 마을어장 1–2, 근거 수 보정 0–2를 조합해 "
                "다시 계산했습니다 (폐어구가 가장 위험하다는 전제는 유지). 순위상관은 1에 가까울수록 순위가 그대로라는 뜻입니다.")
     st.info("**읽는 법:** 상위 3 유지율이 100%인 지점은 가중치를 어떻게 바꿔도 우선 수거 대상입니다. "
-            "김녕리처럼 유지율이 낮은 지점은 돌고래 근거가 순위를 끌어올리는 곳이라, 돌고래 배율을 0으로 두면 내려갑니다. "
-            "공식을 숨기지 않고 어떤 요소가 순위를 만드는지 보여주는 화면입니다.")
+            "유지율이 낮은 지점은 특정 요소(돌고래 근거, 근거 수 보정 등)에 순위가 기대는 곳이라, 위 슬라이더로 그 요소를 "
+            "바꿔 보면 바로 확인할 수 있습니다. 공식을 숨기지 않고 어떤 요소가 순위를 만드는지 보여주는 화면입니다.")
 
     st.divider()
     st.markdown("#### 요소 간 중복 점검")

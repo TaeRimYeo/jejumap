@@ -1,5 +1,6 @@
 .streamlit/secrets.toml
 ai_usage.json
 reports.json
+cleanups.json
 __pycache__/
 *.zip
