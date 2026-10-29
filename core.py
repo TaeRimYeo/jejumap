@@ -225,7 +225,8 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
     t = struct.copy()
     rows = t.to_dict("records")
     cols = {k: [] for k in ("public_evidence", "record_count", "report_count", "evidence", "avg_hazard",
-                            "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history", "potential")}
+                            "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history", "potential",
+                            "last_seen")}
     risks = []
     for r in rows:
         cut = done.get(r["name"])
@@ -245,6 +246,8 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
         cols["evidence"].append(len(act))
         cols["history"].append(len(all_ev))
         cols["last_cleanup"].append(cut.date().isoformat() if cut else "")
+        seen = [e["date"] for e in all_ev if e["date"]] + ([cut.date()] if cut else [])
+        cols["last_seen"].append(max(seen).isoformat() if seen else "")   # 누가 마지막으로 가 본 날 (수거 포함)
         if not act:
             for k in ("avg_hazard", "adj_hazard", "freshness"):
                 cols[k].append(float("nan"))
@@ -281,6 +284,74 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
 def build_table(beaches, reports, winter_on, records=None, w=None, today=None, cleanups=None):
     """지점별 현재 위험 지수, 근거 수, 상태."""
     return score_structure(build_structure(beaches, reports, records), winter_on, w, today, cleanups)
+
+
+# ---------- 해안 구역(마을어장 지선) 단위 확인 공백 ----------
+ZONE_ATTACH_M = 1500      # 지점을 가장 가까운 구역에 붙이는 최대 거리
+RECENT_CHECK_DAYS = 180   # 이 기간 안에 근거·수거가 있으면 '최근 확인'
+ZONE_STATES = ("확인 기록 없음", "오래전 확인", "최근 확인")
+
+
+def load_zones(path):
+    import json
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)["features"]
+
+
+def dist_to_zone_m(lat, lon, rings):
+    """점에서 다각형까지 거리(m). 안쪽이면 0. 제주 범위에서는 평면 근사로 충분."""
+    kx, ky = 111320 * math.cos(math.radians(lat)), 110540
+    best, inside = float("inf"), False
+    for ring in rings:
+        P = [((lo - lon) * kx, (la - lat) * ky) for lo, la in ring]
+        for (x1, y1), (x2, y2) in zip(P, P[1:] + P[:1]):
+            dx, dy = x2 - x1, y2 - y1
+            L = dx * dx + dy * dy
+            t = 0 if L == 0 else max(0.0, min(1.0, -(x1 * dx + y1 * dy) / L))
+            best = min(best, math.hypot(x1 + t * dx, y1 + t * dy))
+            if (y1 > 0) != (y2 > 0) and x1 - y1 * dx / dy > 0:
+                inside = not inside
+    return 0.0 if inside else best
+
+
+def zone_coverage(table, zones, winter_on=False, w=None, today=None):
+    """구역마다 마지막으로 누군가 확인한 날(근거·수거)을 계산.
+    지점은 가장 가까운 구역 하나에 붙임(1.5km 이내). 제보가 없다는 건 '깨끗하다'가 아니라 '모른다'이므로
+    확인 기록 없음 / 오래전 확인을 따로 드러내고, 민감도(돌고래·겨울 북서풍) 높은 곳부터 순찰 순서를 매김."""
+    w = w or default_weights()
+    today = _to_date(today) or _dt.date.today()
+    seen = {}
+    for r in table.itertuples():
+        if not r.last_seen:
+            continue
+        d = [(dist_to_zone_m(r.lat, r.lon, z["geometry"]["coordinates"]), i) for i, z in enumerate(zones)]
+        dm, i = min(d)
+        if dm <= ZONE_ATTACH_M:
+            seen.setdefault(i, []).append((_to_date(r.last_seen), r.name))
+    out = []
+    for i, z in enumerate(zones):
+        p = z["properties"]
+        side = coast_side(p["lat"], p["lon"])
+        sens = sensitivity(p["emd"], True, side, winter_on, w)    # 마을어장 구역이므로 어장 가중 적용
+        hits = seen.get(i, [])
+        last = max(d for d, _ in hits) if hits else None
+        days = (today - last).days if last else None
+        state = ZONE_STATES[0] if last is None else ZONE_STATES[1] if days > RECENT_CHECK_DAYS else ZONE_STATES[2]
+        out.append({"zone_id": p["zone_id"], "zone": p["name"], "emd": p["emd"], "lat": p["lat"], "lon": p["lon"],
+                    "coast_side": side, "dolphin": dolphin_weight(p["emd"], w), "sensitivity": round(sens, 2),
+                    "last_check": last.isoformat() if last else "", "days_since": days, "state": state,
+                    "points": ", ".join(sorted({n for _, n in hits}))})
+    df = pd.DataFrame(out)
+    order = {s: k for k, s in enumerate(ZONE_STATES)}
+    df["_o"] = df.state.map(order)
+    df["_d"] = df.days_since.fillna(10 ** 6)
+    df = df.sort_values(["_o", "sensitivity", "_d"], ascending=[True, False, False]).drop(columns=["_o", "_d"])
+    return df.reset_index(drop=True)
+
+
+def coverage_summary(cov):
+    c = cov.state.value_counts()
+    return {s: int(c.get(s, 0)) for s in ZONE_STATES} | {"total": len(cov)}
 
 
 def priority(table, n=5):

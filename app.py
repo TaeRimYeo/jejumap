@@ -48,6 +48,18 @@ def cached_robustness(reports_json, cleanups_json, winter_on, today):
                            today=today, cleanups=json.loads(cleanups_json))
 
 
+@st.cache_data
+def load_zones():
+    try:
+        return core.load_zones(BASE / "zones.geojson")
+    except OSError:
+        return []
+
+
+ZONE_STYLE = {"확인 기록 없음": {"color": "#C0392B", "dashArray": "5 5", "fillOpacity": 0.10, "weight": 2},
+              "오래전 확인": {"color": "#7E6BB0", "dashArray": "", "fillOpacity": 0.15, "weight": 2},
+              "최근 확인": {"color": "#2E8B57", "dashArray": "", "fillOpacity": 0.20, "weight": 2}}
+
 STALE, DONE = "#A99BC9", "#FFFFFF"
 
 
@@ -122,6 +134,9 @@ with st.sidebar:
 table = core.build_table(beaches, st.session_state.reports, winter, records,
                          today=TODAY, cleanups=st.session_state.cleanups)
 
+zones = load_zones()
+cov = core.zone_coverage(table, zones, winter, today=TODAY) if zones else None
+
 tab_map, tab_report, tab_list, tab_check = st.tabs(
     ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
 
@@ -151,7 +166,40 @@ with tab_map:
     st.caption(f"근거: 공공 조사(2021) {int(beaches.hazard_index.notna().sum())}곳 · 기관·언론 기록 {len(records)}건 · "
                f"시민 제보 {len(st.session_state.reports)}건 · 기준일 {TODAY:%Y-%m-%d}")
 
+    if cov is not None:
+        cs = core.coverage_summary(cov)
+        st.markdown("#### 🕳️ 해안 확인 공백: 제보가 없는 곳은 '깨끗한 곳'이 아니라 '모르는 곳'")
+        z1, z2, z3, z4 = st.columns(4)
+        z1.metric("해안 구역 (마을어장 지선)", f"{cs['total']}곳")
+        z2.metric(f"최근 {core.RECENT_CHECK_DAYS}일 안에 확인", f"{cs['최근 확인']}곳",
+                  f"{cs['최근 확인'] / cs['total'] * 100:.0f}%", delta_color="off")
+        z3.metric("오래전 확인", f"{cs['오래전 확인']}곳")
+        z4.metric("확인 기록 없음", f"{cs['확인 기록 없음']}곳")
+        dall = cov[cov.dolphin >= 1.0]
+        dz = dall[dall.state == "확인 기록 없음"]
+        if len(dz):
+            st.warning(f"돌고래 보호구역이 있는 **대정읍 해안 {len(dall)}개 구역 중 {len(dz)}곳이 확인 기록 없음**입니다. "
+                       "위험 순위에 안 나오는 건 안전해서가 아니라 아무도 보지 않았기 때문입니다.")
+        show_zones = st.toggle("지도에 해안 구역별 확인 상태 표시", value=True)
+    else:
+        show_zones = False
+
     m = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap")
+    if show_zones:
+        info = cov.set_index("zone_id")
+        feats = []
+        for f in zones:
+            zi = info.loc[f["properties"]["zone_id"]]
+            p = dict(f["properties"], state=zi.state, last_check=zi.last_check or "없음",
+                     points=zi.points or "-")
+            feats.append({**f, "properties": p})
+        folium.GeoJson(
+            {"type": "FeatureCollection", "features": feats}, name="해안 구역",
+            style_function=lambda f: {**ZONE_STYLE[f["properties"]["state"]],
+                                      "fillColor": ZONE_STYLE[f["properties"]["state"]]["color"]},
+            tooltip=folium.GeoJsonTooltip(fields=["name", "emd", "state", "last_check", "points"],
+                                          aliases=["구역", "읍면동", "상태", "마지막 확인", "확인한 지점"]),
+        ).add_to(m)
     for r in table.itertuples():
         src = ORANGE if r.report_count else (TEAL if r.record_count else BLUE)
         score = r.risk_index
@@ -179,6 +227,10 @@ with tab_map:
     st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · **회보라 오래된 근거(재확인 필요)** · "
                "흰색 수거 완료 · 회색 미측정　| 크기: 근거 수　"
                "| 테두리: 파랑 공공 조사 · 청록 기관·언론 기록 · 주황 시민 제보 포함")
+    if show_zones:
+        st.caption("▭ 해안 구역(마을어장 지선): **빨간 점선 = 확인 기록 없음** · 보라 = 오래전 확인"
+                   f"({core.RECENT_CHECK_DAYS}일 넘음) · 초록 = 최근 확인. 확인 = 조사·기록·제보·수거 완료 중 하나라도 있었던 날. "
+                   "출처: 해양수산부 국립해양조사원 어장정보도(마을어업), 추자도 제외")
 
     st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
     live = core.priority(table, n=len(table))
@@ -189,6 +241,8 @@ with tab_map:
     live.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "마지막 근거", "최신성",
                     "공공 조사", "기관 기록", "시민 제보", "근거 수"]
     st.dataframe(live, hide_index=True, use_container_width=True)
+    st.caption("⚠️ 이 순위는 **근거가 있는 지점끼리만** 비교한 것입니다. 순위에 없는 해안은 안전한 곳이 아니라 확인되지 않은 곳이며, "
+               "'📋 우선 수거 리포트' 탭의 확인 공백 구역 목록으로 따로 관리합니다.")
     st.caption("제보가 들어오면 올라가고, 시간이 지나거나 수거 완료 처리하면 내려갑니다. "
                "'재확인 필요'는 쓰레기가 없다는 뜻이 아니라 최근에 확인한 사람이 없다는 뜻이에요.")
 
@@ -325,10 +379,25 @@ with tab_list:
             save_cleanups()
             st.rerun()
 
+    if cov is not None:
+        st.divider()
+        st.markdown("#### 🕳️ 확인 공백 구역 (한 번도 확인되지 않은 해안부터)")
+        st.caption("제보·기록이 없는 구역은 깨끗한 게 아니라 **모르는 곳**입니다. 위험 순위에는 안 나오므로 따로 순찰 목록을 만듭니다. "
+                   "순서: 확인 기록 없음 → 오래전 확인, 같은 상태 안에서는 민감도(돌고래·마을어장·겨울 북서풍) 높은 곳 먼저.")
+        gap = cov[cov.state != "최근 확인"].head(15)
+        gv = gap[["zone", "emd", "state", "sensitivity", "last_check", "points"]].copy()
+        gv.insert(0, "순서", range(1, len(gv) + 1))
+        gv.columns = ["순서", "해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "근처 지점"]
+        st.dataframe(gv, hide_index=True, use_container_width=True)
+        full = cov[cov.state != "최근 확인"][["zone", "emd", "state", "sensitivity", "last_check", "lat", "lon"]]
+        full.columns = ["해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "위도", "경도"]
+        st.download_button(f"📥 확인 공백 구역 전체 {len(full)}곳 CSV", full.to_csv(index=False).encode("utf-8-sig"),
+                           file_name=f"확인공백구역_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
     if len(stale):
         st.divider()
-        st.markdown("#### 🔎 순찰 권장 (오래 확인되지 않은 해안)")
+        st.markdown("#### 🔎 재확인 권장 지점 (예전에 쓰레기가 확인된 곳)")
         sv = stale[["name", "emd", "status", "potential", "last_date", "last_cleanup"]].copy()
         sv.columns = ["지점", "읍면동", "상태", "원래 위험도", "마지막 근거", "마지막 수거"]
         st.dataframe(sv, hide_index=True, use_container_width=True)
