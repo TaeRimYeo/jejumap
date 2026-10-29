@@ -13,17 +13,17 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-KINDS = ("reports", "cleanups", "patrols", "reviews")
+KINDS = ("reports", "cleanups", "patrols", "reviews", "ai_tests")
 TABLE = "events"
 
-# 이미 만든 테이블에 'reviews'(제보 검토) 종류를 허용하는 변경
+# 이미 만든 테이블에 'reviews'(제보 검토)·'ai_tests'(AI 정확도 시험) 종류를 허용하는 변경
 UPGRADE_SQL = """alter table public.events drop constraint if exists events_kind_check;
 alter table public.events add constraint events_kind_check
-  check (kind in ('reports', 'cleanups', 'patrols', 'reviews'));"""
+  check (kind in ('reports', 'cleanups', 'patrols', 'reviews', 'ai_tests'));"""
 
 SETUP_SQL = """create table if not exists public.events (
   id text primary key,
-  kind text not null check (kind in ('reports', 'cleanups', 'patrols', 'reviews')),
+  kind text not null check (kind in ('reports', 'cleanups', 'patrols', 'reviews', 'ai_tests')),
   data jsonb not null,
   created_at timestamptz not null default now()
 );

@@ -43,7 +43,7 @@
 ```sql
 create table if not exists public.events (
   id text primary key,
-  kind text not null check (kind in ('reports', 'cleanups', 'patrols', 'reviews')),
+  kind text not null check (kind in ('reports', 'cleanups', 'patrols', 'reviews', 'ai_tests')),
   data jsonb not null,
   created_at timestamptz not null default now()
 );
@@ -58,6 +58,12 @@ SUPABASE_KEY = "sb_secret_..."
 ```
 secret 키는 서버(Streamlit)에서만 쓰이고 브라우저로 나가지 않습니다. 테이블은 RLS가 켜져 있어 공개 키로는 읽고 쓸 수 없습니다.
 무료 플랜은 1주일 동안 사용이 없으면 일시 정지되므로, 시연 전에 대시보드에서 상태를 확인하세요.
+
+## 양·해조류·AI 정확도
+- 양(적음/보통/많음)은 제보 때 받아 **점수에는 넣지 않고** 권장 인력·장비로 표시 (우선 수거 표·브리핑·지도). 제보에 양이 없으면 최근 기관 수거량(kg)으로 규모를 짐작
+- 해조류는 평소 위해성 1, 단 '많음'이거나 플라스틱·어구가 섞이면 2 (괭생이모자반 대량 유입 시 양식장 파손·선박 감김·부패). 대량 해조류는 '부패 전 신속 수거'로 따로 알림
+- AI는 종류를 추천만 하고 확신(confidence) 0.6 미만이면 기본값으로 고르지 않음. 정확도 근거: 정답 사진 시험(앱에서 종류별 업로드), 현장 제보의 AI 제안 vs 최종 종류, 지킴이 확인 제보 기준 일치율, 헷갈림 표
+- DB에 ai_tests 종류를 허용하려면 아래 SQL을 다시 실행
 
 ## 기존 업무와 연결 ("또 하나의 앱"이 되지 않게)
 - 기존 신고(안전신문고)를 대신하지 않고, 신고·수거 기록을 모아 '어디부터 치울지'를 정하는 판단 도구
@@ -75,7 +81,7 @@ secret 키는 서버(Streamlit)에서만 쓰이고 브라우저로 나가지 않
 ```sql
 alter table public.events drop constraint if exists events_kind_check;
 alter table public.events add constraint events_kind_check
-  check (kind in ('reports', 'cleanups', 'patrols', 'reviews'));
+  check (kind in ('reports', 'cleanups', 'patrols', 'reviews', 'ai_tests'));
 ```
 
 ## 개인정보·보안

@@ -6,3 +6,4 @@ __pycache__/
 *.zip
 patrols.json
 reviews.json
+ai_tests.json

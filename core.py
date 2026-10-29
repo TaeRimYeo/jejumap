@@ -33,17 +33,50 @@ PRIOR_K = 1.0
 HALF_LIFE_PUBLIC = 1095   # 3년
 HALF_LIFE_EVENT = 180     # 6개월
 PUBLIC_DATE = "2021-12-31"   # 2021년 연 6회 조사의 마지막 시점으로 잡음
+# 작업량(양): 점수에는 넣지 않고 인력·장비 배치 참고로만 씀
+AMOUNTS = ("적음", "보통", "많음")
+AMOUNT_HELP = {"적음": "한두 봉지 · 혼자 치울 정도", "보통": "마대 여러 개 · 몇 명이 반나절", "많음": "차량·장비가 필요할 정도"}
+CREW = {"적음": "1–2명 · 집게·마대 2–3개 · 1시간 이내",
+        "보통": "3–5명 · 마대 10개 내외·장갑 · 반나절",
+        "많음": "지킴이 1개 조(6명 이상) + 수거 차량"}
+CREW_EXTRA = {"fishing_gear": "그물·로프 절단 도구, 무거우면 집게차·크레인, 어촌계 협조",
+              "seaweed": "굴삭기·덤프트럭, 부패 전 3일 안 수거, 퇴비화 처리처 확인",
+              "styrofoam": "부서지기 전 통째로 수거, 대형 마대"}
+
+
+def amount_from_kg(kg):
+    """기관 기록의 수거량(kg) -> 작업량 단계 (참고용 구간)."""
+    if kg is None or pd.isna(kg):
+        return None
+    return "적음" if kg < 50 else "보통" if kg < 500 else "많음"
+
+
+def crew_plan(amount, category=None):
+    """작업량·종류 -> 권장 인력·장비 (참고용 가정치)."""
+    if amount not in CREW:
+        return "현장 확인 후 배치"
+    plan = CREW[amount]
+    if amount == "많음" and category in CREW_EXTRA:
+        plan += " · " + CREW_EXTRA[category]
+    elif amount == "보통" and category == "fishing_gear":
+        plan += " · 그물·로프 절단 도구"
+    return plan
+
+
 UNVERIFIED_W = 0.5      # 검토 전 시민 제보 1건의 무게 (지킴이 확인 또는 다른 사람 같은 제보가 있으면 1)
 DUP_HOURS = 24          # 같은 지점·같은 종류 제보를 한 건으로 묶는 시간 창
 NO_CHECK = "확인 기록 없음"   # 근거가 하나도 없는 지점·구역 ('깨끗함'이 아님)
 SOURCE_LABEL = {"public": "공공 조사(2021)", "record": "기관·언론 기록(2025~26)", "report": "시민 제보"}
 
 
+SEAWEED_MASS_H = 2   # 해조류라도 대량이거나 다른 쓰레기가 섞이면: 양식장·어장 파손, 선박 프로펠러 감김, 부패
+
+
 def default_weights():
     """가중치 묶음. 민감도 분석에서 이 값을 바꿔 가며 순위를 다시 계산한다."""
     return {"hazard": dict(HAZARD), "dolphin_scale": 1.0, "fishery": FISHERY_W, "winter": WINTER_NW_W,
             "prior_k": PRIOR_K, "prior_m": PRIOR_M,
-            "hl_public": HALF_LIFE_PUBLIC, "hl_event": HALF_LIFE_EVENT}
+            "hl_public": HALF_LIFE_PUBLIC, "hl_event": HALF_LIFE_EVENT, "seaweed_mass": SEAWEED_MASS_H}
 
 
 def _to_date(v):
@@ -74,6 +107,16 @@ def decay(source, ev_date, today, w=None):
     hl = w["hl_public"] if source == "public" else w["hl_event"]
     age = max(0, (today - ev_date).days)
     return 0.5 ** (age / hl) if hl else 1.0
+
+
+def evidence_hazard(e, row, w):
+    """근거 1건의 위해성. 해조류는 평소 1이지만 '많음'이거나 다른 쓰레기가 섞이면 SEAWEED_MASS_H."""
+    if e["source"] == "public":
+        return public_hazard(row, w)
+    h = w["hazard"][e["category"]]
+    if e["category"] == "seaweed" and (e.get("amount") == "많음" or e.get("mixed")):
+        h = max(h, w.get("seaweed_mass", SEAWEED_MASS_H))
+    return h
 
 
 def adjusted_hazard(hz_sum, n, w=None):
@@ -160,7 +203,8 @@ def _evidence_items(beaches, reports, records):
         items.append(dict(source="record", category=rec["category"], date=_to_date(rec.get("date")),
                           at=_to_dt(rec.get("date")),
                           place=rec["place"], emd=rec["emd"], lat=rec.get("lat"), lon=rec.get("lon"),
-                          attach_name=rec.get("attach_to_name"), near_fishery=_as_bool(rec.get("near_fishery"))))
+                          attach_name=rec.get("attach_to_name"), near_fishery=_as_bool(rec.get("near_fishery")),
+                          amount_kg=pd.to_numeric(rec.get("amount_kg"), errors="coerce")))
     # 제보는 시각·id 순으로 정렬: 세션마다 불러온 순서가 달라도 같은 지점 이름이 나오게
     for rep in sorted(reports or [], key=lambda r: (str(r.get("time", "")), str(r.get("_id", "")))):
         items.append(dict(source="report", category=rep["category"], date=_to_date(rep.get("time")),
@@ -168,6 +212,7 @@ def _evidence_items(beaches, reports, records):
                           place=rep["place"], emd=rep["emd"], lat=rep["lat"], lon=rep["lon"],
                           attach_name=rep.get("attach_to_name"), attach_idx=rep.get("attach_to"),
                           rid=rep.get("_id"), sid=rep.get("sid") or rep.get("_id"), review=rep.get("review"),
+                          amount=rep.get("amount"), mixed=bool(rep.get("mixed")),
                           near_fishery=rep.get("near_fishery")))
     return items
 
@@ -194,8 +239,11 @@ def build_structure(beaches, reports, records=None):
         e = {"source": it["source"], "category": it["category"], "date": it["date"], "at": it["at"],
              "lat": it.get("lat") if pd.notna(it.get("lat")) else None,
              "lon": it.get("lon") if pd.notna(it.get("lon")) else None}
+        if it["source"] == "record" and pd.notna(it.get("amount_kg")):
+            e["amount_kg"] = float(it["amount_kg"])
         if it["source"] == "report":
-            e.update(rid=it.get("rid"), sid=it.get("sid"), review=it.get("review"))
+            e.update(rid=it.get("rid"), sid=it.get("sid"), review=it.get("review"),
+                     amount=it.get("amount"), mixed=it.get("mixed", False))
         if idx is not None:
             evid[idx].append(e)
         else:
@@ -263,8 +311,11 @@ def merge_reports(evs):
             sids = {x.get("sid") for x in g}
             ok = any(x.get("review") == "ok" for x in g) or len(sids) >= 2
             newest = max(g, key=lambda x: x["at"] or _dt.datetime.min)
+            amts = [x.get("amount") for x in g if x.get("amount") in AMOUNTS]
             out.append(dict(newest, w=1.0 if ok else UNVERIFIED_W, n_reports=len(g), verified=ok,
-                            ids=[x.get("rid") for x in g]))
+                            ids=[x.get("rid") for x in g],
+                            amount=max(amts, key=AMOUNTS.index) if amts else None,
+                            mixed=any(x.get("mixed") for x in g)))
     return out
 
 
@@ -292,7 +343,8 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
     rows = t.to_dict("records")
     cols = {k: [] for k in ("public_evidence", "record_count", "report_count", "evidence", "avg_hazard",
                             "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history", "potential",
-                            "last_seen", "unverified", "weight")}
+                            "last_seen", "unverified", "weight",
+                            "workload", "work_category", "crew", "seaweed_mass")}
     risks = []
     for r in rows:
         cut = done.get(r["name"])
@@ -301,7 +353,7 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
         sens = sensitivity(r["emd"], r["village_fishery"], r["coast_side"], winter_on, w)
         if all_ev:   # 순찰 우선순위용: 최신성·수거 여부를 빼고 본 원래 위험도
             m_all = merge_reports(all_ev)
-            hs_all = [(public_hazard(r, w) if e["source"] == "public" else hz[e["category"]]) * e["w"] for e in m_all]
+            hs_all = [evidence_hazard(e, r, w) * e["w"] for e in m_all]
             n_all = sum(e["w"] for e in m_all)
             cols["potential"].append(round((sum(hs_all) + w["prior_k"] * w["prior_m"]) / (n_all + w["prior_k"]) * sens, 2))
         else:
@@ -313,6 +365,27 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
         cols["unverified"].append(sum(1 for e in act if e["source"] == "report" and not e.get("verified")))
         cols["evidence"].append(len(act))
         cols["weight"].append(round(sum(e["w"] for e in act), 2))
+        rep_ev = [e for e in act if e["source"] == "report" and e.get("amount") in AMOUNTS]
+        if rep_ev:
+            big = max(rep_ev, key=lambda e: (AMOUNTS.index(e["amount"]), w["hazard"][e["category"]]))
+            cols["workload"].append(big["amount"])
+            cols["work_category"].append(big["category"])
+            cols["crew"].append(crew_plan(big["amount"], big["category"]))
+        else:
+            kg_ev = [e for e in act if e["source"] == "record" and e.get("amount_kg")]
+            if kg_ev:                    # 제보에 양이 없으면 최근 기관 수거량으로 규모를 짐작
+                last = max(kg_ev, key=lambda e: e["date"] or _dt.date.min)
+                amt = amount_from_kg(last["amount_kg"])
+                cols["workload"].append(f"{amt} (기관 기록 {last['amount_kg'] / 1000:,.1f}t 기준)" if last["amount_kg"] >= 1000
+                                        else f"{amt} (기관 기록 {last['amount_kg']:,.0f}kg 기준)")
+                cols["work_category"].append(last["category"])
+                cols["crew"].append(crew_plan(amt, last["category"]))
+            else:
+                cols["workload"].append("미확인")
+                cols["work_category"].append("")
+                cols["crew"].append(crew_plan(None))
+        cols["seaweed_mass"].append(any(e["source"] == "report" and e["category"] == "seaweed" and
+                                        (e.get("amount") == "많음" or e.get("mixed")) for e in act))
         cols["history"].append(len(all_ev))
         cols["last_cleanup"].append(cut.date().isoformat() if cut else "")
         seen = [e["date"] for e in all_ev if e["date"]] + ([cut.date()] if cut else [])
@@ -331,7 +404,7 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
             continue
         hs, ds, ws = [], [], []
         for e in act:
-            hs.append(public_hazard(r, w) if e["source"] == "public" else hz[e["category"]])
+            hs.append(evidence_hazard(e, r, w))
             ds.append(decay(e["source"], e["date"] or today, today, w))
             ws.append(e["w"])
         n = sum(ws)                                   # 유효 근거 수 (검토 전 제보는 0.5건)
@@ -556,7 +629,9 @@ def factor_overlap(table):
 PROMPT = ("이 사진은 제주 해안의 쓰레기 사진이다. 가장 많이 보이는 쓰레기 종류를 "
           "fishing_gear(폐어구·그물·로프·낚싯줄·부표·통발), plastic, styrofoam, seaweed, other 중 하나로 고르고, "
           "쓰레기가 아니면 category를 other로 하라. "
-          'JSON 한 줄로만 답하라: {"category":"...","reason":"한 문장"}')
+          "확신 정도를 0~1 사이 confidence로 함께 적어라. "
+          'JSON 한 줄로만 답하라: {"category":"...","confidence":0.0,"reason":"한 문장"}')
+AI_MIN_CONF = 0.6     # 이보다 낮으면 AI 결과를 기본값으로 고르지 않음
 
 
 def parse_vision_json(text):
@@ -567,7 +642,31 @@ def parse_vision_json(text):
     cat = d.get("category", "other")
     if cat not in HAZARD:
         cat = "other"
-    return {"category": cat, "reason": d.get("reason", "")}
+    try:
+        conf = max(0.0, min(1.0, float(d.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        conf = 0.5
+    return {"category": cat, "confidence": round(conf, 2), "reason": d.get("reason", "")}
+
+
+def ai_accuracy(reports, tests=None):
+    """AI 정확도 근거 2가지.
+    - 시험(tests): 정답을 아는 사진으로 잰 정확도 (가장 믿을 만함)
+    - 현장(reports): AI 제안 종류 vs 사람이 최종 고른 종류 (지킴이 확인된 것은 따로)
+    반환: {"test": {...}, "field": {...}, "field_verified": {...}, "confusion": DataFrame}"""
+    def summ(pairs):
+        n = len(pairs)
+        hit = sum(1 for a, b in pairs if a == b)
+        return {"n": n, "correct": hit, "acc": (hit / n) if n else None}
+    test_pairs = [(t.get("predicted"), t.get("truth")) for t in tests or [] if t.get("predicted") and t.get("truth")]
+    field = [(r.get("ai_category"), r.get("category")) for r in reports or []
+             if r.get("ai_category") and r.get("review") != "reject"]
+    field_v = [(r.get("ai_category"), r.get("category")) for r in reports or []
+               if r.get("ai_category") and r.get("review") == "ok"]
+    pairs = test_pairs or field_v or field
+    conf = pd.crosstab(pd.Series([LABEL[b] for a, b in pairs], name="정답(사람)"),
+                       pd.Series([LABEL[a] for a, b in pairs], name="AI 판별")) if pairs else pd.DataFrame()
+    return {"test": summ(test_pairs), "field": summ(field), "field_verified": summ(field_v), "confusion": conf}
 
 
 # ---------- 무료 한도 보호 ----------
@@ -803,6 +902,7 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
         for k, r in enumerate(top.itertuples(), 1):
             lines.append(f"  {k}. {r.name} – 위험 지수 {r.risk_index:.2f}, {r.status}"
                          + (f", 마지막 근거 {r.last_date}" if r.last_date else ""))
+            lines.append(f"     작업량 {r.workload} → {r.crew}")
     else:
         lines.append("  근거가 있는 지점이 없습니다(아래 확인 공백 구역 순찰 필요).")
     if c is not None and len(c):
@@ -810,6 +910,9 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
         lines += ["", f"2) 확인 공백: 해안 구역 {len(c)}곳 중 {len(gap)}곳이 최근 {RECENT_CHECK_DAYS}일 확인 없음"]
         for r in gap.head(n).itertuples():
             lines.append(f"  - {r.zone} ({r.state})")
+    sw = t[t.seaweed_mass] if "seaweed_mass" in t else t.iloc[0:0]
+    if len(sw):
+        lines += ["", "※ 대량 해조류(괭생이모자반 등): 부패 전 신속 수거 – " + ", ".join(sw.name)]
     pend = int(t.unverified.sum()) if "unverified" in t else 0
     if pend:
         lines += ["", f"3) 검토 대기 제보 {pend}묶음 – 출동 전 사진·현장 확인 필요"]

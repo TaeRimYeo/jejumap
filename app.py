@@ -229,6 +229,8 @@ with st.sidebar:
     st.caption(f"허위·중복 제보 대책: 같은 곳·같은 종류 {core.DUP_HOURS}시간 내 제보는 1건으로 묶음 · "
                f"검토 전 제보는 {core.UNVERIFIED_W}건으로 계산, 다른 사람 같은 제보나 지킴이 확인이 있으면 1건 · "
                "허위 판정은 제외")
+    st.caption("해조류는 평소 1이지만 '양 많음'이거나 다른 쓰레기가 섞이면 2 (양식장 파손·선박 감김·부패). "
+               "양은 점수에 넣지 않고 인력·장비 참고로만 표시합니다.")
     st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1 "
                "(버려진 어구 = 해양생물 위협 1위, Wilcox 외 2016)\n\n"
                "돌고래: 대정 1.0(2025 보호구역) · 안덕·구좌 0.5(2026 보도)")
@@ -327,6 +329,7 @@ with tab_map:
                f" (원래 {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'})<br>"
                f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}"
                + (f" (검토 대기 {r.unverified}묶음)" if r.unverified else "") + "<br>"
+               f"작업량: {r.workload}" + (" (대량 해조류)" if r.seaweed_mass else "") + "<br>"
                f"마을어장 인접: {'예' if r.village_fishery else '아니오'}<br>"
                f"돌고래 가중치: {r.dolphin_weight}"
                + (f" ({r.dolphin_basis})" if isinstance(r.dolphin_basis, str) and r.dolphin_basis else ""))
@@ -428,11 +431,24 @@ with tab_report:
             st.session_state.pop("ai", None)       # 사진을 바꾸면 이전 판별 결과는 버림
             ai = None
         if ai:
-            st.success(f"AI 판별: **{core.LABEL[ai['category']]}**  \n{ai['reason']}")
+            conf = ai.get("confidence", 0.5)
+            if conf >= core.AI_MIN_CONF:
+                st.success(f"AI 판별: **{core.LABEL[ai['category']]}** (확신 {conf:.0%})  \n{ai['reason']}")
+            else:
+                st.warning(f"AI가 확신하지 못해요 (확신 {conf:.0%}, 추정: {core.LABEL[ai['category']]}). "
+                           f"사진을 보고 직접 골라주세요.  \n{ai['reason']}")
 
         cats = list(core.HAZARD)
+        ai_pick = ai and ai.get("confidence", 0.5) >= core.AI_MIN_CONF
         cat = st.radio("쓰레기 종류", cats, format_func=lambda c: core.LABEL[c],
-                       index=cats.index(ai["category"]) if ai else 0)
+                       index=cats.index(ai["category"]) if ai_pick else 0)
+        amount = st.radio("양 (인력·장비 배치 참고용, 위험 점수와는 별개)", core.AMOUNTS, index=1, horizontal=True,
+                          captions=[core.AMOUNT_HELP[a] for a in core.AMOUNTS])
+        mixed = False
+        if cat == "seaweed":
+            mixed = st.checkbox("해조류에 플라스틱·어구 같은 다른 쓰레기가 섞여 있어요")
+            st.caption("해조류는 생물에게 직접 해는 적지만, 많거나 다른 쓰레기가 섞이면 양식장·어장을 망가뜨리고 "
+                       "썩기 전에 치워야 해서 위해성을 플라스틱 수준으로 올려 계산해요.")
 
         emd_default = None
         if lat is not None:
@@ -449,7 +465,9 @@ with tab_report:
             new_rep = dict(
                 time=now_kst().strftime("%Y-%m-%d %H:%M:%S"), place=place, lat=round(lat, 5), lon=round(lon, 5),
                 emd=emd, category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
-                attach_to_name=attach, ai=bool(ai) and cat == ai["category"], sid=st.session_state.sid)
+                attach_to_name=attach, ai=bool(ai) and cat == ai["category"], sid=st.session_state.sid,
+                amount=amount, mixed=mixed,
+                ai_category=ai["category"] if ai else None, ai_conf=ai.get("confidence") if ai else None)
             recent = [t for t in st.session_state.get("my_report_times", []) if time.time() - t < 600]
             dup = core.find_duplicate(REPORTS, new_rep)
             problem = core.valid_report(new_rep) or (
@@ -507,16 +525,23 @@ with tab_list:
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)" + (f" · {vemd}" if vemd else ""))
     rep = core.priority(table_v, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
-        ["순위", "name", "emd", "risk_index", "status", "adj_hazard", "evidence", "record_count", "report_count",
-         "village_fishery", "dolphin_basis"]]
+        ["순위", "name", "emd", "risk_index", "status", "workload", "crew", "adj_hazard", "evidence", "record_count",
+         "report_count", "village_fishery", "dolphin_basis"]]
     rep["adj_hazard"] = rep["adj_hazard"].round(2)
-    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "보정 위해성", "근거 수", "기관 기록", "제보 수",
-                   "마을어장 인접", "돌고래 근거"]
+    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "작업량", "권장 인력·장비", "보정 위해성", "근거 수",
+                   "기관 기록", "제보 수", "마을어장 인접", "돌고래 근거"]
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다. "
                "**'검토 대기'** 는 검토 전 시민 제보만 있는 곳이라, 출동 전에 아래 🛡️ 제보 검토에서 사진·현장을 확인하세요.")
     if len(rep):
         st.dataframe(rep, hide_index=True, use_container_width=True)
+        st.caption("순서는 **위험**으로 정하고, **양은 인력·장비를 정하는 참고**로만 씁니다(점수에 넣으면 '많은 곳 먼저'로 돌아가기 때문). "
+                   "권장 인력·장비는 팀이 정한 참고치이니 현장 사정에 맞게 조정하세요. "
+                   "'기관 기록 기준'은 과거 정화 때 치운 양이라 지금 남은 양과 다를 수 있어요(새 제보의 양이 들어오면 그걸 씁니다).")
+    sw = table_v[table_v.seaweed_mass]
+    if len(sw):
+        st.warning("🌿 **대량 해조류 · 부패 전 신속 수거**: " + ", ".join(sw.name) +
+                   " — 괭생이모자반은 3–6월에 몰려 오고, 늦게 치우면 썩어 악취가 나며 양식장·선박 피해가 생겨요.")
     else:
         st.info(f"{vemd or '이 지역'}에는 아직 근거가 있는 지점이 없어요. 안전하다는 뜻이 아니라 확인이 안 된 곳이니, "
                 "아래 🕳️ 확인 공백 구역부터 순찰하세요.")
@@ -779,3 +804,67 @@ with tab_check:
         st.dataframe(corr, use_container_width=True)
     st.caption("마을어장은 제주 해안 대부분에 있어 지점을 거의 구분하지 못합니다(구분력 약함). 그래서 순위를 정하는 힘은 "
                "주로 쓰레기 위해성과 돌고래 근거에서 나옵니다. 지점 수가 적어 상관계수는 참고용입니다.")
+
+    # ---------------- AI 정확도 ----------------
+    st.divider()
+    st.markdown("#### 🤖 AI 판별 정확도 (근거를 쌓는 곳)")
+    acc = core.ai_accuracy(REPORTS, st.session_state.ai_tests)
+    a1, a2, a3 = st.columns(3)
+
+    def _fmt(sm):
+        return "-" if not sm["n"] else f"{sm['acc']:.0%}"
+    a1.metric("정답 사진 시험", _fmt(acc["test"]), f"{acc['test']['n']}장", delta_color="off",
+              help="정답(종류)을 아는 사진을 AI에 보내 맞힌 비율. 가장 믿을 만한 근거")
+    a2.metric("현장: 지킴이 확인 제보", _fmt(acc["field_verified"]), f"{acc['field_verified']['n']}건", delta_color="off",
+              help="AI 제안 종류와, 지킴이가 사실 확인한 제보의 최종 종류가 같은 비율")
+    a3.metric("현장: 전체 제보", _fmt(acc["field"]), f"{acc['field']['n']}건", delta_color="off",
+              help="AI 제안 종류를 제보자가 그대로 쓴 비율 (사람이 고쳐 쓴 경우 = 불일치)")
+    st.caption(f"AI는 종류를 **추천만** 하고 최종 선택은 사람이 합니다. 확신이 {core.AI_MIN_CONF:.0%} 미만이면 "
+               "추천을 기본값으로 고르지 않아요. 정확도는 아래 시험과 실제 제보가 쌓일수록 근거가 됩니다.")
+    if not acc["confusion"].empty:
+        st.caption("어떤 종류를 어떤 종류로 헷갈리는지 (행: 정답, 열: AI 판별)")
+        st.dataframe(acc["confusion"], use_container_width=True)
+
+    with st.expander("🧪 정답 사진으로 정확도 시험하기 (지킴이·팀용)"):
+        st.caption("종류를 아는 사진을 종류별로 올리면 AI 판별 결과와 비교해 정확도를 기록합니다. "
+                   f"한 번에 최대 10장, 무료 한도 보호(분당 {core.SAFE_PER_MINUTE}회·하루 {core.SAFE_PER_DAY}회)가 그대로 적용되고, "
+                   "같은 사진은 다시 호출하지 않아요. 얼굴·번호판이 보이는 사진은 쓰지 마세요.")
+        if not api_key:
+            st.info("AI 키가 없어 시험할 수 없어요.")
+        else:
+            truth = st.selectbox("이 사진들의 정답 종류", list(core.HAZARD), format_func=lambda c: core.LABEL[c],
+                                 key="test_truth")
+            files = st.file_uploader("사진 (여러 장)", type=["jpg", "jpeg", "png", "webp"], accept_multiple_files=True,
+                                     key="test_files", disabled=not keeper)
+            if files and st.button(f"{min(len(files), 10)}장 시험하기", disabled=not keeper):
+                done_keys = {(t.get("photo"), t.get("truth")) for t in st.session_state.ai_tests}
+                results, stopped = [], None
+                for f in files[:10]:
+                    raw = f.getvalue()
+                    ph = hashlib.sha256(raw).hexdigest()[:16]
+                    if (ph, truth) in done_keys:
+                        continue
+                    clean = core.sanitize_image(raw)
+                    if clean is None:
+                        continue
+                    res, msg = core.classify_guarded(clean[0], clean[1], api_key, guard)
+                    if res is None:
+                        stopped = msg
+                        break
+                    results.append(persist("ai_tests", {"truth": truth, "predicted": res["category"],
+                                                        "confidence": res.get("confidence"), "photo": ph,
+                                                        "logged": now_kst().strftime("%Y-%m-%d %H:%M:%S")}))
+                ok = sum(1 for r in results if r["predicted"] == truth)
+                st.session_state.flash_test = (f"{len(results)}장 시험: {ok}장 맞힘" +
+                                               (f" · 중단: {stopped}" if stopped else ""))
+                st.rerun()
+        if st.session_state.get("flash_test"):
+            st.success(st.session_state.pop("flash_test"))
+        if st.session_state.ai_tests:
+            tl = pd.DataFrame(st.session_state.ai_tests).reindex(columns=["logged", "truth", "predicted", "confidence"])
+            for c in ("truth", "predicted"):
+                tl[c] = tl[c].map(lambda v: core.LABEL.get(v, v))
+            tl.columns = ["시각", "정답", "AI 판별", "확신"]
+            st.dataframe(tl.iloc[::-1].fillna(""), hide_index=True, use_container_width=True)
+            st.download_button("📥 시험 결과 CSV", tl.to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"AI정확도시험_{now_kst():%Y%m%d}.csv", mime="text/csv")
