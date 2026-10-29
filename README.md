@@ -36,6 +36,27 @@
 
 `scripts/build_beaches.py`로 `beaches.csv`, `scripts/build_zones.py`로 `zones.geojson`을 다시 만들 수 있습니다.
 
+## 기록 저장 (Supabase 무료 DB)
+제보·수거 완료·순찰 기록은 Supabase(무료 Postgres)에 저장해 앱 재시작·여러 사용자에도 유지됩니다. 설정이 없으면 앱 폴더의 JSON 파일에 저장합니다 (`store.py`).
+1. supabase.com에서 무료 프로젝트 생성 → SQL Editor에서 아래 실행
+```sql
+create table if not exists public.events (
+  id text primary key,
+  kind text not null check (kind in ('reports', 'cleanups', 'patrols')),
+  data jsonb not null,
+  created_at timestamptz not null default now()
+);
+create index if not exists events_kind_created on public.events (kind, created_at);
+alter table public.events enable row level security;  -- 정책 없음 = 공개 키로는 접근 불가, 서버의 secret 키만 접근
+```
+2. Project Settings → API Keys에서 Project URL과 **secret 키**를 복사해 Streamlit Secrets에 추가
+```toml
+SUPABASE_URL = "https://xxxx.supabase.co"
+SUPABASE_KEY = "sb_secret_..."
+```
+secret 키는 서버(Streamlit)에서만 쓰이고 브라우저로 나가지 않습니다. 테이블은 RLS가 켜져 있어 공개 키로는 읽고 쓸 수 없습니다.
+무료 플랜은 1주일 동안 사용이 없으면 일시 정지되므로, 시연 전에 대시보드에서 상태를 확인하세요.
+
 ## 실행
 ```
 pip install -r requirements.txt

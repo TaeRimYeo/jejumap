@@ -15,8 +15,10 @@ from streamlit_folium import st_folium
 import importlib
 
 import core
+import store as store_mod
 
 core = importlib.reload(core)   # 배포 서버가 옛 core.py를 메모리에 들고 있지 않게
+store_mod = importlib.reload(store_mod)
 
 BASE = Path(__file__).parent
 st.set_page_config(page_title="제주 해안 지킴이 지도", page_icon="🌊", layout="wide")
@@ -87,36 +89,61 @@ def color_for(score, status=""):
 beaches = load_beaches()
 records_df = load_records_df()
 records = records_df.to_dict("records")
-REPORTS_FILE = BASE / "reports.json"
-if "reports" not in st.session_state:          # 앱을 껐다 켜도 제보 유지
+
+
+def _secret(name):
     try:
-        st.session_state.reports = json.loads(REPORTS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        st.session_state.reports = []
+        return st.secrets.get(name, "") or os.environ.get(name, "")
+    except Exception:              # secrets.toml 없음
+        return os.environ.get(name, "")
+
+
+@st.cache_resource
+def get_store(url, key):
+    return store_mod.open_store(url, key, BASE)
+
+
+store = get_store(_secret("SUPABASE_URL"), _secret("SUPABASE_KEY"))
+
+
+def load_all(force=False):
+    """세션 시작 때 한 번(또는 새로고침 버튼) 저장소에서 기록을 불러옴."""
+    if force or "reports" not in st.session_state:
+        try:
+            data = store.load()
+            st.session_state.store_error = ""
+        except store_mod.StoreError as e:
+            data = {k: st.session_state.get(k, []) for k in store_mod.KINDS}
+            st.session_state.store_error = str(e)
+        for k in store_mod.KINDS:
+            st.session_state[k] = data[k]
+
+
+def persist(kind, rec):
+    """기록 추가: 저장소에 먼저 쓰고, 성공하든 실패하든 화면에는 바로 반영."""
+    try:
+        rec = store.add(kind, rec)
+        st.session_state.store_error = ""
+    except store_mod.StoreError as e:
+        rec = dict(rec, _id=rec.get("_id") or store_mod.new_id(), _unsaved=True)
+        st.session_state.store_error = str(e)
+    st.session_state[kind].append(rec)
+    return rec
+
+
+def drop(kind, ids):
+    ids = set(ids)
+    try:
+        store.remove(kind, [i for i in ids if i])
+        st.session_state.store_error = ""
+    except store_mod.StoreError as e:
+        st.session_state.store_error = str(e)
+    st.session_state[kind] = [r for r in st.session_state[kind] if r.get("_id") not in ids]
+
+
+load_all()
 if "stamps" not in st.session_state:
     st.session_state.stamps = set()
-CLEANUPS_FILE = BASE / "cleanups.json"
-if "cleanups" not in st.session_state:         # 수거 완료 기록
-    try:
-        st.session_state.cleanups = json.loads(CLEANUPS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        st.session_state.cleanups = []
-
-
-def save_cleanups():
-    CLEANUPS_FILE.write_text(json.dumps(st.session_state.cleanups, ensure_ascii=False), encoding="utf-8")
-
-
-PATROLS_FILE = BASE / "patrols.json"
-if "patrols" not in st.session_state:          # 순찰 확인(이상 없음) 기록
-    try:
-        st.session_state.patrols = json.loads(PATROLS_FILE.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        st.session_state.patrols = []
-
-
-def save_patrols():
-    PATROLS_FILE.write_text(json.dumps(st.session_state.patrols, ensure_ascii=False), encoding="utf-8")
 
 
 TODAY = datetime.now().date()
@@ -127,10 +154,19 @@ with st.sidebar:
     st.caption("쓰레기 양이 아니라 **생물에게 위험한 순서**로 수거 우선순위를 보여줍니다.")
     winter = st.toggle("겨울 북서계절풍 가중 (북·서 해안 ×1.2)", value=False)
     st.divider()
-    try:
-        api_key = st.secrets.get("GEMINI_API_KEY", "")
-    except Exception:              # secrets.toml 없음
-        api_key = os.environ.get("GEMINI_API_KEY", "")
+    n_rec = sum(len(st.session_state[k]) for k in store_mod.KINDS)
+    if store.backend == "supabase":
+        st.markdown(f"💾 기록 저장 **DB 연결됨** (모든 사용자 공유) · {n_rec}건")
+    else:
+        st.markdown(f"💾 기록 저장: 이 컴퓨터의 파일 · {n_rec}건")
+        st.caption("DB 설정이 없어 앱 폴더에 저장합니다. 클라우드에서는 재시작하면 사라질 수 있어요.")
+    if st.session_state.get("store_error"):
+        st.error("DB 저장/불러오기 실패. 화면에는 보이지만 저장되지 않았을 수 있어요.  \n" + st.session_state.store_error)
+    if st.button("🔄 다른 사람 기록까지 새로고침", use_container_width=True):
+        load_all(force=True)
+        st.rerun()
+    st.divider()
+    api_key = _secret("GEMINI_API_KEY")
     guard = core.QuotaGuard(BASE / "ai_usage.json")
     us = guard.status(time.time())
     if api_key:
@@ -339,12 +375,11 @@ with tab_report:
             attach = int(near.name) if dist <= 1000 else None
             fishery = bool(near.village_fishery) if dist <= 1000 else True  # 제주 해안 대부분 마을어장
             place = near["name"] if attach is not None else f"제보 지점 ({emd})"
-            st.session_state.reports.append(dict(
+            persist("reports", dict(
                 time=datetime.now().strftime("%Y-%m-%d %H:%M"), place=place, lat=lat, lon=lon, emd=emd,
                 category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
                 attach_to=attach, ai=bool(ai)))
             st.session_state.pop("ai", None)
-            REPORTS_FILE.write_text(json.dumps(st.session_state.reports, ensure_ascii=False), encoding="utf-8")
             new = core.build_table(beaches, st.session_state.reports, winter, records,
                                    today=TODAY, cleanups=st.session_state.cleanups)
             after, _ = core.nearest_point(new, lat, lon)     # 이름이 '#2'로 바뀌어도 위치로 찾음
@@ -385,9 +420,8 @@ with tab_list:
         who = cc2.text_input("처리자 / 메모 (선택)", key="cleanup_who", placeholder="예: 안덕면 바다환경지킴이 2명")
         cc3.write("")
         if cc3.button("수거 완료", type="primary", use_container_width=True):
-            st.session_state.cleanups.append({"site": site, "date": TODAY.isoformat(), "by": who,
-                                              "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
-            save_cleanups()
+            persist("cleanups", {"site": site, "date": TODAY.isoformat(), "by": who,
+                                 "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
             st.session_state.flash_clean = f"✅ **{site}** 수거 완료 처리됨. 지도와 순위에서 내려갔어요."
             st.rerun()
     if st.session_state.get("flash_clean"):
@@ -397,8 +431,7 @@ with tab_list:
         log.columns = ["완료일", "지점", "처리자/메모", "기록 시각"]
         st.dataframe(log.iloc[::-1], hide_index=True, use_container_width=True)
         if st.button("↩️ 마지막 완료 처리 되돌리기"):
-            st.session_state.cleanups.pop()
-            save_cleanups()
+            drop("cleanups", [st.session_state.cleanups[-1].get("_id")])
             st.rerun()
 
     if cov is not None:
@@ -434,14 +467,11 @@ with tab_list:
             now = datetime.now()
             pid = now.strftime("%Y%m%d%H%M%S%f")
             logged = now.strftime("%Y-%m-%d %H:%M")
-            st.session_state.patrols.append({"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
-                                             "id": pid, "cleared": clear})
+            persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
+                                "id": pid, "cleared": clear})
             for site in clear:
-                st.session_state.cleanups.append({"site": site, "date": TODAY.isoformat(), "logged": logged,
-                                                  "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""),
-                                                  "patrol": pid})
-            save_patrols()
-            save_cleanups()
+                persist("cleanups", {"site": site, "date": TODAY.isoformat(), "logged": logged,
+                                     "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""), "patrol": pid})
             st.session_state.flash_patrol = (f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
                                              + (f" 수거 완료 처리: {', '.join(clear)}" if clear else ""))
             st.rerun()
@@ -453,11 +483,10 @@ with tab_list:
             plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "함께 수거 완료 처리", "기록 시각"]
             st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
             if st.button("↩️ 마지막 순찰 기록 되돌리기"):
-                last = st.session_state.patrols.pop()
+                last = st.session_state.patrols[-1]
                 if last.get("id"):          # 이 순찰로 만든 수거 완료 기록도 함께 취소
-                    st.session_state.cleanups = [c for c in st.session_state.cleanups if c.get("patrol") != last["id"]]
-                save_patrols()
-                save_cleanups()
+                    drop("cleanups", [c.get("_id") for c in st.session_state.cleanups if c.get("patrol") == last["id"]])
+                drop("patrols", [last.get("_id")])
                 st.rerun()
 
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
