@@ -17,7 +17,7 @@ import core
 BASE = Path(__file__).parent
 st.set_page_config(page_title="제주 해안 지킴이 지도", page_icon="🌊", layout="wide")
 
-BLUE, ORANGE = "#1D4E9E", "#E8833A"
+BLUE, TEAL, ORANGE = "#1D4E9E", "#1A9E8F", "#E8833A"
 
 
 @st.cache_data
@@ -28,6 +28,19 @@ def load_trend():
 @st.cache_data
 def load_beaches():
     return pd.read_csv(BASE / "beaches.csv", encoding="utf-8-sig")
+
+
+@st.cache_data
+def load_records_df():
+    try:
+        return pd.read_csv(BASE / "records.csv", encoding="utf-8-sig")
+    except OSError:
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner="160개 가중치 조합으로 다시 계산 중...")
+def cached_robustness(reports_json, winter_on):
+    return core.robustness(load_beaches(), json.loads(reports_json), load_records_df().to_dict("records"), winter_on)
 
 
 def color_for(score):
@@ -41,6 +54,8 @@ def color_for(score):
 
 
 beaches = load_beaches()
+records_df = load_records_df()
+records = records_df.to_dict("records")
 REPORTS_FILE = BASE / "reports.json"
 if "reports" not in st.session_state:          # 앱을 껐다 켜도 제보 유지
     try:
@@ -69,13 +84,16 @@ with st.sidebar:
     else:
         st.caption("AI 키가 없어요. 제보 화면에서 종류를 직접 고르면 됩니다.")
     st.divider()
-    st.markdown("**위험 지수**  \n= 평균 위해성 × (1+돌고래) × 마을어장 × 계절  \n**근거 수** = 공공 조사 + 제보 건수")
-    st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1\n\n"
+    st.markdown("**위험 지수**  \n= 평균 위해성 × (1+돌고래) × 마을어장 × 계절  \n"
+                "**근거 수** = 공공 조사 + 기관·언론 기록 + 시민 제보")
+    st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1 "
+               "(버려진 어구 = 해양생물 위협 1위, Wilcox 외 2016)\n\n"
                "돌고래: 대정 1.0(2025 보호구역) · 안덕·구좌 0.5(2026 보도)")
 
-table = core.build_table(beaches, st.session_state.reports, winter)
+table = core.build_table(beaches, st.session_state.reports, winter, records)
 
-tab_map, tab_report, tab_list = st.tabs(["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트"])
+tab_map, tab_report, tab_list, tab_check = st.tabs(
+    ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
 
 # ---------------- 1. 지도 ----------------
 with tab_map:
@@ -94,22 +112,23 @@ with tab_map:
                "치우는 양은 늘었지만, 어디부터 치울지 정하는 기준은 아직 없습니다.")
     st.divider()
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("지도 지점", len(table))
-    c2.metric("공공데이터 측정 지점", int(table.public_evidence.sum()))
-    c3.metric("시민 제보", len(st.session_state.reports))
-    c4.metric("미측정 지점", int(table.risk_index.isna().sum()))
+    c2.metric("공공 조사 (2021)", int(table.public_evidence.sum()))
+    c3.metric("기관·언론 기록 (2025~26)", len(records))
+    c4.metric("시민 제보", len(st.session_state.reports))
+    c5.metric("미측정 지점", int(table.risk_index.isna().sum()))
 
     m = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap")
     for r in table.itertuples():
-        src = BLUE if r.report_count == 0 else ORANGE
+        src = ORANGE if r.report_count else (TEAL if r.record_count else BLUE)
         score = r.risk_index
         size = 7 if pd.isna(score) else min(24, 9 + 3 * r.evidence)
         tip = f"{r.name} · " + ("미측정 (제보 필요)" if pd.isna(score) else f"위험 지수 {score:.2f} · 근거 {r.evidence}건")
         pop = (f"<b>{r.name}</b> ({r.type})<br>"
                f"위험 지수: {'미측정' if pd.isna(score) else f'{score:.2f}'}<br>"
                f"평균 위해성: {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'}<br>"
-               f"근거: 공공 조사(2021) {r.public_evidence}건 · 시민 제보 {r.report_count}건<br>"
+               f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}<br>"
                f"마을어장 인접: {'예' if r.village_fishery else '아니오'}<br>"
                f"돌고래 가중치: {r.dolphin_weight}"
                + (f" ({r.dolphin_basis})" if isinstance(r.dolphin_basis, str) and r.dolphin_basis else ""))
@@ -118,15 +137,26 @@ with tab_map:
                             tooltip=tip, popup=folium.Popup(pop, max_width=280)).add_to(m)
     st_folium(m, height=520, use_container_width=True, returned_objects=[])
     st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3~4.5) · 초록 낮음 · 회색 미측정　"
-               "| 크기: 근거 수　| 테두리: 파랑 공공데이터(2021) · 주황 시민 제보 포함")
+               "| 크기: 근거 수　| 테두리: 파랑 공공 조사 · 초록 기관·언론 기록 · 주황 시민 제보 포함")
 
-    st.markdown("#### 📊 현재 위험 순위 (공공데이터 + 시민 제보)")
+    st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
     live = core.priority(table, n=len(table))
     live = live.assign(순위=range(1, len(live) + 1))[
-        ["순위", "name", "emd", "risk_index", "public_evidence", "report_count", "evidence"]]
-    live.columns = ["순위", "지점", "읍면동", "위험 지수", "공공 조사", "시민 제보", "근거 수"]
+        ["순위", "name", "emd", "risk_index", "public_evidence", "record_count", "report_count", "evidence"]]
+    live.columns = ["순위", "지점", "읍면동", "위험 지수", "공공 조사", "기관 기록", "시민 제보", "근거 수"]
     st.dataframe(live, hide_index=True, use_container_width=True)
     st.caption(f"제보가 들어올 때마다 바뀝니다. 아직 근거가 없는 지점 {int(table.risk_index.isna().sum())}곳은 순위에서 빠져 있어요.")
+
+    if len(records_df):
+        st.markdown("#### 🗂️ 기관·언론 정화 기록 (2025~2026)")
+        rv = records_df[["date", "place", "category", "amount_kg", "debris", "org", "source", "url", "note"]].copy()
+        rv["category"] = rv["category"].map(core.LABEL)
+        rv["amount_kg"] = rv["amount_kg"].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}")
+        rv.columns = ["날짜", "장소", "분류", "수거량(kg)", "쓰레기 내용", "주체", "출처", "링크", "비고"]
+        st.dataframe(rv.fillna(""), hide_index=True, use_container_width=True,
+                     column_config={"링크": st.column_config.LinkColumn("링크", display_text="기사")})
+        st.caption("바다에 직접 가지 않아도 최신 현장을 반영하기 위해, 장소·날짜·쓰레기 종류가 확인되는 보도만 근거로 넣었습니다. "
+                   "위치가 '근사'인 기록은 마을 중심 좌표를 썼습니다.")
 
     st.markdown("#### 공공데이터(2021)로 본 '개수' 기준 vs '위험 지수' 기준")
     st.dataframe(core.rank_compare(beaches), hide_index=True, use_container_width=True)
@@ -195,7 +225,7 @@ with tab_report:
             st.session_state.stamps.add(place)
             st.session_state.pop("ai", None)
             REPORTS_FILE.write_text(json.dumps(st.session_state.reports, ensure_ascii=False), encoding="utf-8")
-            new = core.build_table(beaches, st.session_state.reports, winter)
+            new = core.build_table(beaches, st.session_state.reports, winter, records)
             after = new[new.name == place].iloc[0]
             st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {after.risk_index:.2f} · "
                                       f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요.")
@@ -210,8 +240,10 @@ with tab_list:
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)")
     rep = core.priority(table, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
-        ["순위", "name", "emd", "risk_index", "avg_hazard", "evidence", "report_count", "village_fishery", "dolphin_basis"]]
-    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "평균 위해성", "근거 수", "제보 수", "마을어장 인접", "돌고래 근거"]
+        ["순위", "name", "emd", "risk_index", "avg_hazard", "evidence", "record_count", "report_count",
+         "village_fishery", "dolphin_basis"]]
+    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "평균 위해성", "근거 수", "기관 기록", "제보 수",
+                   "마을어장 인접", "돌고래 근거"]
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다.")
     st.dataframe(rep, hide_index=True, use_container_width=True)
@@ -222,3 +254,50 @@ with tab_list:
         st.markdown("#### 제보 기록")
         st.dataframe(pd.DataFrame(st.session_state.reports)[["time", "place", "emd", "category", "ai"]],
                      hide_index=True, use_container_width=True)
+
+# ---------------- 4. 가중치 검증 ----------------
+with tab_check:
+    st.markdown("#### 가중치를 바꿔도 순위가 유지될까?")
+    st.caption("위해성 3·2·1은 측정값이 아니라 순위 척도입니다. 숫자를 바꿔 보며 결과가 얼마나 흔들리는지 직접 확인하세요.")
+    a, b = st.columns(2)
+    with a:
+        fg = st.slider("폐어구·로프·낚싯줄", 1.0, 5.0, 3.0, 0.5)
+        pl = st.slider("플라스틱·스티로폼", 1.0, 5.0, 2.0, 0.5)
+        ot = st.slider("해조류·기타", 0.5, 3.0, 1.0, 0.5)
+    with b:
+        ds = st.slider("돌고래 가중치 배율 (0 = 돌고래 무시)", 0.0, 2.0, 1.0, 0.25)
+        fi = st.slider("마을어장 인접 배율", 1.0, 2.0, core.FISHERY_W, 0.25)
+    w = core.default_weights()
+    w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl, seaweed=ot, other=ot)
+    w.update(dolphin_scale=ds, fishery=fi)
+    custom = core.build_table(beaches, st.session_state.reports, winter, records, w)
+    base_t = table[table.risk_index.notna()].set_index("name")
+    cus_t = custom[custom.risk_index.notna()].set_index("name")
+    base_r = base_t.risk_index.rank(ascending=False, method="min").astype(int)
+    cus_r = cus_t.risk_index.rank(ascending=False, method="min").astype(int)
+    cmp = pd.DataFrame({"기본 순위": base_r, "바꾼 가중치 순위": cus_r, "바꾼 위험 지수": cus_t.risk_index})
+    cmp["변화"] = (cmp["기본 순위"] - cmp["바꾼 가중치 순위"]).map(lambda d: "—" if d == 0 else (f"▲{d}" if d > 0 else f"▼{-d}"))
+    st.dataframe(cmp.sort_values("바꾼 가중치 순위").reset_index(names="지점"), hide_index=True, use_container_width=True)
+    if pl >= fg:
+        st.warning("플라스틱이 폐어구보다 같거나 높게 설정됐어요. 연구 근거(버려진 어구 = 위협 1위)와 반대되는 가정입니다.")
+
+    st.divider()
+    st.markdown("#### 자동 민감도 분석")
+    rb, summ = cached_robustness(json.dumps(st.session_state.reports, ensure_ascii=False), winter)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("시험한 가중치 조합", f"{summ['scenarios']}개")
+    m2.metric("기본 순위와 평균 순위상관", f"{summ['rho_mean']:.2f}")
+    m3.metric("가장 다른 조합의 순위상관", f"{summ['rho_min']:.2f}")
+    st.dataframe(rb, hide_index=True, use_container_width=True)
+    st.caption("폐어구 2~5, 플라스틱·스티로폼 1.5~2.5, 돌고래 배율 0~1.5, 마을어장 1~2를 조합해 다시 계산했습니다 "
+               "(폐어구가 가장 위험하다는 전제는 유지). 순위상관은 1에 가까울수록 순위가 그대로라는 뜻입니다.")
+
+    st.divider()
+    st.markdown("#### 요소 간 중복 점검")
+    info, corr, n = core.factor_overlap(table)
+    st.dataframe(info, hide_index=True, use_container_width=True)
+    if not corr.empty and corr.shape[0] > 1:
+        st.caption(f"근거가 있는 {n}개 지점에서 요소 간 상관계수")
+        st.dataframe(corr, use_container_width=True)
+    st.caption("마을어장은 제주 해안 대부분에 있어 지점을 거의 구분하지 못합니다. 그래서 순위를 정하는 힘은 "
+               "주로 쓰레기 위해성과 돌고래 근거에서 나옵니다.")

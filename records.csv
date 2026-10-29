@@ -1,0 +1,7 @@
+﻿date,place,emd,lat,lon,attach_to_name,category,amount_kg,debris,org,source,url,note,village_fishery_dist_m,village_fishery_near,near_fishery
+2026-10-24,사계해변 해안사구,안덕면,,,제주 사계리,fishing_gear,900.0,"폐어구, 플라스틱 부표, 생활쓰레기",해양환경공단 외(가플지우),데일리환경 2026.10.26,https://www.dailyt.co.kr/newsView/dlt202610260034,,,,
+2026-10-22,닭머르해안,조천읍,33.53439,126.62156,,plastic,4500.0,"생활쓰레기(플라스틱, 낡은 어망, 비닐)",하이트진로 외,뉴스핌 2026.10.26,https://www.newspim.com/news/view/20261026000619,2026년 4회 누적 수거량. 위치는 신촌리 기준 근사,409.0,신촌리 지선,True
+2026-10-23,제주항 10부두 인근 해안,건입동,33.52447,126.54487,,other,8000.0,종류 미기재,제주도개발공사 외,뉴스제주 2026.10.26,https://www.newsjeju.net/news/articleView.html?idxno=427489,기사에 쓰레기 종류가 없어 '기타'로 분류,1648.0,화북동 지선,False
+2026-09-05,삼양해수욕장,삼양동,,,삼양검은모래,plastic,,"플라스틱, 캔, 유리병",대한적십자사봉사회 제주시협의회,국제뉴스 2026.9.8,https://www.gukjenews.com/news/articleView.html?idxno=3688990,수거량 미기재,,,
+2025-12-28,화북 금산마을 해안,화북동,33.52641,126.565,,fishing_gear,100000.0,"스티로폼 부표 등 폐어구, 밧줄, 폐그물, 중국발 쓰레기",화북 주민 150여 명,JIBS 2025.12.28,https://www.jibs.co.kr/news/articles/articlesDetail/55787,수거량은 기사 속 추산치(100톤 이상). 위치는 화북포구 기준 근사,0.0,화북동 지선,True
+2025-11-07,차귀도 일대,한경면,33.31117,126.14718,,fishing_gear,20000.0,"폐플라스틱, 폐스티로폼, 폐어구",진에어·제주해경 외,이데일리 2025.11.7,https://www.edaily.co.kr/News/Read?mediaCodeNo=257&newsId=03411206642363424,,83.0,고산리(차귀도)지선,True
