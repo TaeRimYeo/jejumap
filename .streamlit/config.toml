@@ -1,0 +1,2 @@
+[server]
+maxUploadSize = 10   # MB, 사진 제보용

@@ -2,6 +2,7 @@
 실행:  streamlit run app.py
 """
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -202,7 +203,8 @@ with st.sidebar:
         st.markdown(f"💾 기록 저장: 이 컴퓨터의 파일 · {n_rec}건")
         st.caption("DB 설정이 없어 앱 폴더에 저장합니다. 클라우드에서는 재시작하면 사라질 수 있어요.")
     if st.session_state.get("store_error"):
-        st.error("DB 저장/불러오기 실패. 화면에는 보이지만 저장되지 않았을 수 있어요.  \n" + st.session_state.store_error)
+        st.error("DB 저장/불러오기 실패. 화면에는 보이지만 저장되지 않았을 수 있어요. 잠시 후 🔄 새로고침을 눌러주세요.")
+        print("[store]", st.session_state.store_error)     # 자세한 내용은 서버 로그에만
     if st.button("🔄 다른 사람 기록까지 새로고침", use_container_width=True):
         load_all(force=True)
         st.rerun()
@@ -364,12 +366,16 @@ with tab_map:
 # ---------------- 2. 제보 ----------------
 with tab_report:
     st.markdown("#### 해변 쓰레기를 찍어 올려주세요")
+    st.caption("🔒 이름·연락처는 받지 않아요. 사진은 저장하지 않고, 위치는 쓰레기가 있는 곳(지도에서 고른 지점)만 기록합니다. "
+               "내 휴대폰의 GPS 위치는 수집하지 않아요.")
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
         st.balloons()
+    if st.session_state.get("flash_err"):
+        st.error(st.session_state.pop("flash_err"))
     left, right = st.columns([1, 1])
     with left:
-        photo = st.file_uploader("사진", type=["jpg", "jpeg", "png", "webp"])
+        photo = st.file_uploader("사진 (10MB 이하)", type=["jpg", "jpeg", "png", "webp"])
         if photo:
             st.image(photo, use_container_width=True)
 
@@ -389,9 +395,18 @@ with tab_report:
 
     with right:
         ai = None
-        if photo and api_key and st.button("🤖 AI로 종류 판별", use_container_width=True):
+        ok_photo = False
+        if photo and api_key:
+            ok_photo = st.checkbox("사람 얼굴·차량 번호판·집 주소가 보이지 않는 사진이에요", key="photo_ok",
+                                   help="AI 판별을 누르면 사진이 Google Gemini(무료 등급)로 전송돼요. Google 약관상 무료 등급에는 "
+                                        "개인정보가 담긴 자료를 보내면 안 됩니다. 앱은 전송 전에 위치(GPS)·기기 정보(EXIF)를 지우고 크기를 줄여요.")
+        if photo and api_key and st.button("🤖 AI로 종류 판별", use_container_width=True, disabled=not ok_photo):
+            clean = core.sanitize_image(photo.getvalue())
             with st.spinner("사진 분석 중..."):
-                ai, msg = core.classify_guarded(photo.getvalue(), photo.type, api_key, guard)
+                if clean is None:
+                    ai, msg = None, "사진을 읽지 못했어요. 종류를 직접 골라주세요."
+                else:
+                    ai, msg = core.classify_guarded(clean[0], clean[1], api_key, guard)
             if ai:
                 st.session_state.ai = dict(ai, photo=hashlib.sha256(photo.getvalue()).hexdigest())
             if msg:                          # 상한·실패 시에도 수동 입력으로 계속
@@ -419,10 +434,18 @@ with tab_report:
             attach = near["name"] if dist <= 1000 else None
             fishery = bool(near.village_fishery) if dist <= 1000 else True  # 제주 해안 대부분 마을어장
             place = near["name"] if attach is not None else f"제보 지점 ({emd})"
-            persist("reports", dict(
-                time=now_kst().strftime("%Y-%m-%d %H:%M:%S"), place=place, lat=lat, lon=lon, emd=emd,
-                category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
-                attach_to_name=attach, ai=bool(ai) and cat == ai["category"]))
+            new_rep = dict(
+                time=now_kst().strftime("%Y-%m-%d %H:%M:%S"), place=place, lat=round(lat, 5), lon=round(lon, 5),
+                emd=emd, category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
+                attach_to_name=attach, ai=bool(ai) and cat == ai["category"])
+            recent = [t for t in st.session_state.get("my_report_times", []) if time.time() - t < 600]
+            problem = core.valid_report(new_rep) or (
+                "10분에 제보 10건까지 받아요. 잠시 후 다시 해주세요." if len(recent) >= 10 else None)
+            if problem:
+                st.session_state.flash_err = problem
+                st.rerun()
+            st.session_state.my_report_times = recent + [time.time()]
+            persist("reports", new_rep)
             st.session_state.pop("ai", None)
             new = core.build_table(beaches, st.session_state.reports, winter, records,
                                    today=TODAY, cleanups=st.session_state.cleanups)
@@ -440,6 +463,18 @@ with tab_report:
 
 # ---------------- 3. 리포트 ----------------
 with tab_list:
+    admin_code = _secret("ADMIN_CODE")
+    if admin_code and not st.session_state.get("keeper"):
+        with st.expander("🔒 지킴이·담당자 로그인 (수거 완료·순찰 기록용)"):
+            code = st.text_input("지킴이 코드", type="password", key="keeper_code")
+            if st.button("확인", key="keeper_btn"):
+                if hmac.compare_digest(code.strip(), admin_code):
+                    st.session_state.keeper = True
+                    st.rerun()
+                st.error("코드가 맞지 않아요.")
+    keeper = (not admin_code) or bool(st.session_state.get("keeper"))
+    if not keeper:
+        st.caption("수거 완료·순찰 기록은 지킴이 코드가 있어야 할 수 있어요. 목록 보기와 CSV 다운로드는 누구나 가능합니다.")
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)")
     rep = core.priority(table, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
@@ -462,10 +497,11 @@ with tab_list:
     if open_sites:
         cc1, cc2, cc3 = st.columns([2, 2, 1])
         site = cc1.selectbox("완료할 지점", open_sites, key="cleanup_site")
-        who = cc2.text_input("처리자 / 메모 (선택)", key="cleanup_who", placeholder="예: 안덕면 바다환경지킴이 2명")
+        who = cc2.text_input("처리자 / 메모 (선택, 이름·연락처 쓰지 마세요)", key="cleanup_who", max_chars=core.MEMO_MAX,
+                             placeholder="예: 안덕면 바다환경지킴이 2명")
         cc3.write("")
-        if cc3.button("수거 완료", type="primary", use_container_width=True):
-            persist("cleanups", {"site": site, "date": TODAY.isoformat(), "by": who,
+        if cc3.button("수거 완료", type="primary", use_container_width=True, disabled=not keeper):
+            persist("cleanups", {"site": site, "date": TODAY.isoformat(), "by": core.scrub_memo(who),
                                  "logged": now_kst().strftime("%Y-%m-%d %H:%M:%S")})
             st.session_state.flash_clean = f"✅ **{site}** 수거 완료 처리됨. 지도와 순위에서 내려갔어요."
             st.rerun()
@@ -476,7 +512,7 @@ with tab_list:
         log.columns = ["완료일", "지점", "처리자/메모", "기록 시각"]
         st.dataframe(log.iloc[::-1].fillna(""), hide_index=True, use_container_width=True)
         mine = my_last("cleanups")
-        if mine and st.button(f"↩️ 내가 한 마지막 완료 처리 되돌리기 ({mine['site']})"):
+        if keeper and mine and st.button(f"↩️ 내가 한 마지막 완료 처리 되돌리기 ({mine['site']})"):
             drop("cleanups", [mine["_id"]])
             st.rerun()
 
@@ -504,12 +540,13 @@ with tab_list:
         emd_of = dict(zip(cov.zone, cov.emd))
         pz1, pz2, pz3 = st.columns([2, 2, 1])
         pz = pz1.selectbox("순찰한 구역", zone_opts, key="patrol_zone", format_func=lambda z: f"{z} ({emd_of[z]})")
-        pwho = pz2.text_input("순찰자 / 메모 (선택)", key="patrol_who", placeholder="예: 대정읍 지킴이, 해변 2km 도보")
+        pwho = core.scrub_memo(pz2.text_input("순찰자 / 메모 (선택, 이름·연락처 쓰지 마세요)", key="patrol_who",
+                                              max_chars=core.MEMO_MAX, placeholder="예: 대정읍 지킴이, 해변 2km 도보"))
         pz3.write("")
         clear = core.stale_points_in_zone(table, zones, pz)
         if clear:
             st.caption("이 구역의 재확인 필요 지점 → 함께 수거 완료 처리: **" + ", ".join(clear) + "**")
-        if pz3.button("이상 없음 기록", use_container_width=True):
+        if pz3.button("이상 없음 기록", use_container_width=True, disabled=not keeper):
             now = now_kst()
             pid = now.strftime("%Y%m%d%H%M%S%f")
             logged = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -529,7 +566,7 @@ with tab_list:
             plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "함께 수거 완료 처리", "기록 시각"]
             st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
             last = my_last("patrols")
-            if last and st.button(f"↩️ 내가 한 마지막 순찰 기록 되돌리기 ({last['zone']})"):
+            if keeper and last and st.button(f"↩️ 내가 한 마지막 순찰 기록 되돌리기 ({last['zone']})"):
                 linked = [c.get("_id") for c in st.session_state.cleanups if last.get("id") and c.get("patrol") == last["id"]]
                 if drop("cleanups", linked):     # 이 순찰로 만든 수거 완료 기록도 함께 취소
                     drop("patrols", [last["_id"]])

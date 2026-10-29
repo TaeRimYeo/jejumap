@@ -572,6 +572,59 @@ class QuotaGuard:
             self._save()
 
 
+# ---------- 개인정보·보안 ----------
+JEJU_BBOX = (33.10, 33.60, 126.10, 127.00)    # 위도 최소·최대, 경도 최소·최대 (본섬+가파·마라·우도)
+MEMO_MAX = 60
+_PHONE = re.compile(r"(\+?82[-\s]?)?0?1[016789][-.\s]?\d{3,4}[-.\s]?\d{4}|0\d{1,2}[-.\s]?\d{3,4}[-.\s]?\d{4}")
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+_RRN = re.compile(r"\d{6}[-\s]?[1-4]\d{6}")
+
+
+def scrub_memo(text):
+    """메모에 실수로 적은 전화번호·이메일·주민번호를 가리고 길이를 제한."""
+    t = (text or "").strip()[:MEMO_MAX]
+    t = _RRN.sub("[주민번호 삭제]", t)
+    t = _EMAIL.sub("[이메일 삭제]", t)
+    t = _PHONE.sub("[전화번호 삭제]", t)
+    return t
+
+
+def in_jeju(lat, lon):
+    a, b, c, d = JEJU_BBOX
+    try:
+        return a <= float(lat) <= b and c <= float(lon) <= d
+    except (TypeError, ValueError):
+        return False
+
+
+def valid_report(rep):
+    """저장 전 서버 쪽 검증. 문제가 있으면 이유(문자열), 없으면 None."""
+    if rep.get("category") not in HAZARD:
+        return "쓰레기 종류가 올바르지 않아요."
+    if not in_jeju(rep.get("lat"), rep.get("lon")):
+        return "제주 해안 범위 밖의 위치예요. 지도에서 다시 골라주세요."
+    if rep.get("emd") not in EMD_LIST:
+        return "읍면동이 올바르지 않아요."
+    return None
+
+
+def sanitize_image(image_bytes, max_side=1024):
+    """AI로 보내기 전 사진 정리: 위치(GPS)·촬영기기 등 메타데이터(EXIF) 제거 + 크기 축소.
+    반환: (바이트, mime). Pillow가 없거나 읽을 수 없으면 None."""
+    try:
+        from PIL import Image, ImageOps
+        import io
+        im = Image.open(io.BytesIO(image_bytes))
+        im = ImageOps.exif_transpose(im)            # 회전 정보만 반영하고 EXIF는 버림
+        im = im.convert("RGB")
+        im.thumbnail((max_side, max_side))
+        out = io.BytesIO()
+        im.save(out, format="JPEG", quality=85)     # 새로 저장 = 메타데이터 없음
+        return out.getvalue(), "image/jpeg"
+    except Exception:
+        return None
+
+
 def classify_guarded(image_bytes, mime, api_key, guard, model=None, now=None, call=None):
     """캐시 -> 상한 확인 -> 호출. 반환: (결과, 메시지). 결과가 None이면 호출하지 않았거나 실패."""
     now = time.time() if now is None else now
