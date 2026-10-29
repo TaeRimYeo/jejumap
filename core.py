@@ -62,7 +62,7 @@ def _to_dt(v, end_of_day=False):
     s = str(v).strip()
     if len(s) <= 10:
         return _dt.datetime.combine(_dt.date.fromisoformat(s[:10]), _dt.time.max if end_of_day else _dt.time.min)
-    return _dt.datetime.fromisoformat(s[:16].replace(" ", "T"))
+    return _dt.datetime.fromisoformat(s[:19].replace(" ", "T"))
 
 
 def decay(source, ev_date, today, w=None):
@@ -158,11 +158,13 @@ def _evidence_items(beaches, reports, records):
                           at=_to_dt(rec.get("date")),
                           place=rec["place"], emd=rec["emd"], lat=rec.get("lat"), lon=rec.get("lon"),
                           attach_name=rec.get("attach_to_name"), near_fishery=_as_bool(rec.get("near_fishery"))))
-    for rep in reports or []:
+    # 제보는 시각·id 순으로 정렬: 세션마다 불러온 순서가 달라도 같은 지점 이름이 나오게
+    for rep in sorted(reports or [], key=lambda r: (str(r.get("time", "")), str(r.get("_id", "")))):
         items.append(dict(source="report", category=rep["category"], date=_to_date(rep.get("time")),
                           at=_to_dt(rep.get("time")),
                           place=rep["place"], emd=rep["emd"], lat=rep["lat"], lon=rep["lon"],
-                          attach_idx=rep.get("attach_to"), near_fishery=rep.get("near_fishery")))
+                          attach_name=rep.get("attach_to_name"), attach_idx=rep.get("attach_to"),
+                          rid=rep.get("_id"), near_fishery=rep.get("near_fishery")))
     return items
 
 
@@ -175,10 +177,10 @@ def build_structure(beaches, reports, records=None):
             for h in t["hazard_index"]]
     for it in _evidence_items(beaches, reports, records):
         idx = None
-        if it.get("attach_idx") is not None and it["attach_idx"] in t.index:
-            idx = it["attach_idx"]
-        elif isinstance(it.get("attach_name"), str) and (t.name == it["attach_name"]).any():
+        if isinstance(it.get("attach_name"), str) and (t.name == it["attach_name"]).any():
             idx = t.index[t.name == it["attach_name"]][0]
+        elif it.get("attach_idx") is not None and it["attach_idx"] in t.index:   # 예전 제보(행 번호로 저장)
+            idx = it["attach_idx"]
         elif pd.notna(it.get("lat")):
             near, dist = nearest_point(t, it["lat"], it["lon"])
             if dist <= ATTACH_M:
@@ -190,9 +192,10 @@ def build_structure(beaches, reports, records=None):
             evid[idx].append(e)
         else:
             fishery = it["near_fishery"] if it["near_fishery"] is not None else True  # 제주 해안 대부분 마을어장
-            name, k = it["place"], 2
+            base = f"{it['place']} · {it['rid'][:4]}" if it.get("rid") else it["place"]  # 제보 id로 고정된 이름
+            name, k = base, 2
             while (t.name == name).any():          # 같은 이름의 다른 지점이 있으면 번호를 붙여 구분
-                name = f"{it['place']} #{k}"
+                name = f"{base} #{k}"
                 k += 1
             row = dict(name=name, type="기관 기록" if it["source"] == "record" else "시민제보",
                        emd=it["emd"], lat=it["lat"], lon=it["lon"], coast_side=coast_side(it["lat"], it["lon"]),
@@ -507,13 +510,22 @@ DEFAULT_MODEL = "gemini-flash-lite-latest"
 SAFE_PER_DAY = 100
 
 
+import threading
+
+_QUOTA_LOCK = threading.Lock()
+
+
 class QuotaGuard:
     """호출 기록을 파일에 남겨 앱을 껐다 켜도 하루 상한이 유지되게 한다. 같은 사진은 다시 부르지 않는다."""
 
     def __init__(self, path):
         self.path = path
+        self._load()
+
+    def _load(self):
+        """여러 사용자가 동시에 쓰므로 판단·기록 직전마다 파일을 다시 읽는다."""
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(self.path, encoding="utf-8") as f:
                 self.d = json.load(f)
         except (OSError, ValueError):
             self.d = {}
@@ -527,9 +539,15 @@ class QuotaGuard:
     def _recent(self, now, seconds):
         return [t for t in self.d["calls"] if now - t < seconds]
 
+    @staticmethod
+    def _kst_day(t):           # 서버는 UTC라서 한국 날짜로 하루를 나눔
+        return time.strftime("%Y-%m-%d", time.gmtime(t + 9 * 3600))
+
     def status(self, now):
-        today = time.strftime("%Y-%m-%d", time.localtime(now))
-        day = [t for t in self.d["calls"] if time.strftime("%Y-%m-%d", time.localtime(t)) == today]
+        with _QUOTA_LOCK:
+            self._load()
+        today = self._kst_day(now)
+        day = [t for t in self.d["calls"] if self._kst_day(t) == today]
         return {"today": len(day), "last_minute": len(self._recent(now, 60)),
                 "day_left": max(0, SAFE_PER_DAY - len(day))}
 
@@ -545,9 +563,13 @@ class QuotaGuard:
         return self.d["cache"].get(h)
 
     def record(self, now, h, result):
-        self.d["calls"] = self._recent(now, 2 * 86400) + [now]
-        self.d["cache"][h] = result
-        self._save()
+        with _QUOTA_LOCK:
+            self._load()
+            self.d["calls"] = self._recent(now, 2 * 86400) + [now]
+            self.d["cache"][h] = result
+            if len(self.d["cache"]) > 500:            # 오래된 캐시부터 정리
+                self.d["cache"] = dict(list(self.d["cache"].items())[-500:])
+            self._save()
 
 
 def classify_guarded(image_bytes, mime, api_key, guard, model=None, now=None, call=None):

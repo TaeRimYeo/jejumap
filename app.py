@@ -1,6 +1,7 @@
 """제주 해안 지킴이 지도 (제주쓰담쓰담) - Streamlit 앱
 실행:  streamlit run app.py
 """
+import hashlib
 import json
 import os
 import time
@@ -106,39 +107,72 @@ def get_store(url, key):
 store = get_store(_secret("SUPABASE_URL"), _secret("SUPABASE_KEY"))
 
 
+if "my_ids" not in st.session_state:       # 이 세션(이 사람)이 쓴 기록만 되돌릴 수 있게
+    st.session_state.my_ids = []
+
+
+def _retry_unsaved():
+    """저장에 실패했던 기록을 다시 저장 (같은 id라 이미 들어갔으면 중복 오류 → 저장된 것으로 봄)."""
+    for k in store_mod.KINDS:
+        for r in st.session_state.get(k, []):
+            if r.get("_unsaved"):
+                try:
+                    store.add(k, {x: v for x, v in r.items() if x != "_unsaved"})
+                    r.pop("_unsaved")
+                except store_mod.StoreError as e:
+                    if "409" in str(e) or "23505" in str(e):     # 이미 저장돼 있음
+                        r.pop("_unsaved")
+
+
 def load_all(force=False):
     """세션 시작 때 한 번(또는 새로고침 버튼) 저장소에서 기록을 불러옴."""
     if force or "reports" not in st.session_state:
+        _retry_unsaved()
+        pending = {k: [r for r in st.session_state.get(k, []) if r.get("_unsaved")] for k in store_mod.KINDS}
         try:
             data = store.load()
             st.session_state.store_error = ""
         except store_mod.StoreError as e:
             data = {k: st.session_state.get(k, []) for k in store_mod.KINDS}
+            pending = {k: [] for k in store_mod.KINDS}
             st.session_state.store_error = str(e)
         for k in store_mod.KINDS:
-            st.session_state[k] = data[k]
+            st.session_state[k] = data[k] + pending[k]     # 아직 못 저장한 기록은 화면에 남김
 
 
 def persist(kind, rec):
-    """기록 추가: 저장소에 먼저 쓰고, 성공하든 실패하든 화면에는 바로 반영."""
+    """기록 추가: id를 먼저 정해 저장소에 쓰고, 성공하든 실패하든 화면에는 바로 반영."""
+    rec = dict(rec, _id=rec.get("_id") or store_mod.new_id())
     try:
-        rec = store.add(kind, rec)
+        store.add(kind, rec)
         st.session_state.store_error = ""
     except store_mod.StoreError as e:
-        rec = dict(rec, _id=rec.get("_id") or store_mod.new_id(), _unsaved=True)
+        rec["_unsaved"] = True
         st.session_state.store_error = str(e)
     st.session_state[kind].append(rec)
+    st.session_state.my_ids.append(rec["_id"])
     return rec
 
 
 def drop(kind, ids):
-    ids = set(ids)
+    """삭제가 성공했을 때만 화면에서도 지움 (실패하면 그대로 두고 오류 표시)."""
+    ids = {i for i in ids if i}
+    unsaved = {r["_id"] for r in st.session_state[kind] if r.get("_id") in ids and r.get("_unsaved")}
     try:
-        store.remove(kind, [i for i in ids if i])
+        store.remove(kind, list(ids - unsaved))
         st.session_state.store_error = ""
     except store_mod.StoreError as e:
         st.session_state.store_error = str(e)
+        return False
     st.session_state[kind] = [r for r in st.session_state[kind] if r.get("_id") not in ids]
+    st.session_state.my_ids = [i for i in st.session_state.my_ids if i not in ids]
+    return True
+
+
+def my_last(kind):
+    """이 세션이 쓴 기록 중 가장 최근 것 (다른 사람 기록은 되돌리지 않음)."""
+    mine = [r for r in st.session_state[kind] if r.get("_id") in st.session_state.my_ids]
+    return mine[-1] if mine else None
 
 
 load_all()
@@ -359,10 +393,13 @@ with tab_report:
             with st.spinner("사진 분석 중..."):
                 ai, msg = core.classify_guarded(photo.getvalue(), photo.type, api_key, guard)
             if ai:
-                st.session_state.ai = ai
+                st.session_state.ai = dict(ai, photo=hashlib.sha256(photo.getvalue()).hexdigest())
             if msg:                          # 상한·실패 시에도 수동 입력으로 계속
                 (st.info if ai else st.warning)(msg)
         ai = st.session_state.get("ai")
+        if ai and (not photo or ai.get("photo") != hashlib.sha256(photo.getvalue()).hexdigest()):
+            st.session_state.pop("ai", None)       # 사진을 바꾸면 이전 판별 결과는 버림
+            ai = None
         if ai:
             st.success(f"AI 판별: **{core.LABEL[ai['category']]}**  \n{ai['reason']}")
 
@@ -379,20 +416,21 @@ with tab_report:
 
         if st.button("제보하기", type="primary", use_container_width=True, disabled=lat is None):
             near, dist = core.nearest_point(beaches, lat, lon)
-            attach = int(near.name) if dist <= 1000 else None
+            attach = near["name"] if dist <= 1000 else None
             fishery = bool(near.village_fishery) if dist <= 1000 else True  # 제주 해안 대부분 마을어장
             place = near["name"] if attach is not None else f"제보 지점 ({emd})"
             persist("reports", dict(
-                time=now_kst().strftime("%Y-%m-%d %H:%M"), place=place, lat=lat, lon=lon, emd=emd,
+                time=now_kst().strftime("%Y-%m-%d %H:%M:%S"), place=place, lat=lat, lon=lon, emd=emd,
                 category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
-                attach_to=attach, ai=bool(ai)))
+                attach_to_name=attach, ai=bool(ai) and cat == ai["category"]))
             st.session_state.pop("ai", None)
             new = core.build_table(beaches, st.session_state.reports, winter, records,
                                    today=TODAY, cleanups=st.session_state.cleanups)
             after, _ = core.nearest_point(new, lat, lon)     # 이름이 '#2'로 바뀌어도 위치로 찾음
             place = after["name"]
             st.session_state.stamps.add(place)
-            st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {after.risk_index:.2f} · "
+            score_txt = "-" if pd.isna(after.risk_index) else f"{after.risk_index:.2f}"
+            st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {score_txt} · "
                                       f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요.")
             st.rerun()                     # 지도·리포트에 바로 반영
 
@@ -428,17 +466,18 @@ with tab_list:
         cc3.write("")
         if cc3.button("수거 완료", type="primary", use_container_width=True):
             persist("cleanups", {"site": site, "date": TODAY.isoformat(), "by": who,
-                                 "logged": now_kst().strftime("%Y-%m-%d %H:%M")})
+                                 "logged": now_kst().strftime("%Y-%m-%d %H:%M:%S")})
             st.session_state.flash_clean = f"✅ **{site}** 수거 완료 처리됨. 지도와 순위에서 내려갔어요."
             st.rerun()
     if st.session_state.get("flash_clean"):
         st.success(st.session_state.pop("flash_clean"))
     if st.session_state.cleanups:
-        log = pd.DataFrame(st.session_state.cleanups)[["date", "site", "by", "logged"]]
+        log = pd.DataFrame(st.session_state.cleanups).reindex(columns=["date", "site", "by", "logged"])
         log.columns = ["완료일", "지점", "처리자/메모", "기록 시각"]
-        st.dataframe(log.iloc[::-1], hide_index=True, use_container_width=True)
-        if st.button("↩️ 마지막 완료 처리 되돌리기"):
-            drop("cleanups", [st.session_state.cleanups[-1].get("_id")])
+        st.dataframe(log.iloc[::-1].fillna(""), hide_index=True, use_container_width=True)
+        mine = my_last("cleanups")
+        if mine and st.button(f"↩️ 내가 한 마지막 완료 처리 되돌리기 ({mine['site']})"):
+            drop("cleanups", [mine["_id"]])
             st.rerun()
 
     if cov is not None:
@@ -473,7 +512,7 @@ with tab_list:
         if pz3.button("이상 없음 기록", use_container_width=True):
             now = now_kst()
             pid = now.strftime("%Y%m%d%H%M%S%f")
-            logged = now.strftime("%Y-%m-%d %H:%M")
+            logged = now.strftime("%Y-%m-%d %H:%M:%S")
             persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
                                 "id": pid, "cleared": clear})
             for site in clear:
@@ -489,11 +528,11 @@ with tab_list:
             plog["cleared"] = plog["cleared"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
             plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "함께 수거 완료 처리", "기록 시각"]
             st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
-            if st.button("↩️ 마지막 순찰 기록 되돌리기"):
-                last = st.session_state.patrols[-1]
-                if last.get("id"):          # 이 순찰로 만든 수거 완료 기록도 함께 취소
-                    drop("cleanups", [c.get("_id") for c in st.session_state.cleanups if c.get("patrol") == last["id"]])
-                drop("patrols", [last.get("_id")])
+            last = my_last("patrols")
+            if last and st.button(f"↩️ 내가 한 마지막 순찰 기록 되돌리기 ({last['zone']})"):
+                linked = [c.get("_id") for c in st.session_state.cleanups if last.get("id") and c.get("patrol") == last["id"]]
+                if drop("cleanups", linked):     # 이 순찰로 만든 수거 완료 기록도 함께 취소
+                    drop("patrols", [last["_id"]])
                 st.rerun()
 
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
@@ -513,8 +552,10 @@ with tab_list:
 
     if st.session_state.reports:
         st.markdown("#### 제보 기록")
-        st.dataframe(pd.DataFrame(st.session_state.reports)[["time", "place", "emd", "category", "ai"]],
-                     hide_index=True, use_container_width=True)
+        rl = pd.DataFrame(st.session_state.reports).reindex(columns=["time", "place", "emd", "category", "ai"])
+        rl["category"] = rl["category"].map(lambda c: core.LABEL.get(c, c))
+        rl.columns = ["시각", "장소", "읍면동", "종류", "AI 판별"]
+        st.dataframe(rl.iloc[::-1].fillna(""), hide_index=True, use_container_width=True)
 
 # ---------------- 4. 가중치 검증 ----------------
 with tab_check:
