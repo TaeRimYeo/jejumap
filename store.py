@@ -137,7 +137,17 @@ class SupabaseStore:
         for i in range(0, len(recs), 500):
             body = [{"id": r["_id"], "kind": kind, "data": {k: v for k, v in r.items() if k != "_id"}}
                     for r in recs[i:i + 500]]
-            self._req("POST", "?on_conflict=id", body, prefer="resolution=ignore-duplicates,return=minimal")
+            try:
+                self._req("POST", "?on_conflict=id", body, prefer="resolution=ignore-duplicates,return=minimal")
+            except StoreError as e:
+                if " 5" in str(e)[:12] or "연결 실패" in str(e):
+                    raise
+                for row in body:            # 한꺼번에 안 되면 한 건씩 (이미 있는 건 건너뜀)
+                    try:
+                        self._req("POST", "", row, prefer="return=minimal")
+                    except StoreError as e2:
+                        if "409" not in str(e2) and "23505" not in str(e2):
+                            raise
         return recs
 
     def remove(self, kind, ids):

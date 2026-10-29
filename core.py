@@ -813,7 +813,7 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
     pend = int(t.unverified.sum()) if "unverified" in t else 0
     if pend:
         lines += ["", f"3) 검토 대기 제보 {pend}묶음 – 출동 전 사진·현장 확인 필요"]
-    link = APP_URL + (f"?emd={urllib.parse.quote(emd)}" if emd else "")
+    link = APP_URL + (f"?emd={emd.replace(' ', '%20')}" if emd else "")   # 한글 그대로 (메신저에서 읽기 쉽게)
     lines += ["", f"지도·상세: {link}"]
     return "\n".join(lines)
 

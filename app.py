@@ -515,7 +515,11 @@ with tab_list:
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다. "
                "**'검토 대기'** 는 검토 전 시민 제보만 있는 곳이라, 출동 전에 아래 🛡️ 제보 검토에서 사진·현장을 확인하세요.")
-    st.dataframe(rep, hide_index=True, use_container_width=True)
+    if len(rep):
+        st.dataframe(rep, hide_index=True, use_container_width=True)
+    else:
+        st.info(f"{vemd or '이 지역'}에는 아직 근거가 있는 지점이 없어요. 안전하다는 뜻이 아니라 확인이 안 된 곳이니, "
+                "아래 🕳️ 확인 공백 구역부터 순찰하세요.")
     st.download_button("📥 지킴이 전달용 CSV 다운로드", rep.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"우선수거구역_{vemd or '전체'}_{now_kst():%Y%m%d}.csv", mime="text/csv")
 
