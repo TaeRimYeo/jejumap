@@ -24,6 +24,7 @@ SETUP_SQL = """create table if not exists public.events (
 );
 create index if not exists events_kind_created on public.events (kind, created_at);
 alter table public.events enable row level security;  -- 정책 없음 = 공개 키로는 접근 불가, 서버의 secret 키만 접근"""
+grant select, insert, delete on public.events to service_role;  -- 서버(secret 키)만 읽기·쓰기
 
 
 class StoreError(Exception):
