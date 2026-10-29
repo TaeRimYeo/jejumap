@@ -12,7 +12,11 @@ import pandas as pd
 import streamlit as st
 from streamlit_folium import st_folium
 
+import importlib
+
 import core
+
+core = importlib.reload(core)   # 배포 서버가 옛 core.py를 메모리에 들고 있지 않게
 
 BASE = Path(__file__).parent
 st.set_page_config(page_title="제주 해안 지킴이 지도", page_icon="🌊", layout="wide")
