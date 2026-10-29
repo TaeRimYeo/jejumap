@@ -49,11 +49,18 @@ def cached_robustness(reports_json, cleanups_json, winter_on, today):
 
 
 @st.cache_data
-def load_zones():
+def load_zones(_mtime):          # 파일이 바뀌면(수정 시각) 캐시를 새로 읽음
     try:
         return core.load_zones(BASE / "zones.geojson")
     except OSError:
         return []
+
+
+def zones_mtime():
+    try:
+        return (BASE / "zones.geojson").stat().st_mtime
+    except OSError:
+        return 0
 
 
 ZONE_STYLE = {"확인 기록 없음": {"color": "#C0392B", "dashArray": "5 5", "fillOpacity": 0.10, "weight": 2},
@@ -146,7 +153,7 @@ with st.sidebar:
 table = core.build_table(beaches, st.session_state.reports, winter, records,
                          today=TODAY, cleanups=st.session_state.cleanups)
 
-zones = load_zones()
+zones = load_zones(zones_mtime())
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
                           patrols=st.session_state.patrols) if zones else None)
 
