@@ -225,11 +225,18 @@ with st.sidebar:
     st.caption(f"최신성: 근거가 오래될수록 가볍게 반영 (반감기 공공 조사 {core.HALF_LIFE_PUBLIC // 365}년, "
                f"기록·제보 {core.HALF_LIFE_EVENT}일). **수거 완료** 처리하면 그 전 근거는 빠집니다.")
     st.caption("근거가 1건뿐인 곳은 중간값(2)과 반반 섞어서, 제보 한 건으로 순위가 튀지 않게 합니다.")
+    st.caption(f"허위·중복 제보 대책: 같은 곳·같은 종류 {core.DUP_HOURS}시간 내 제보는 1건으로 묶음 · "
+               f"검토 전 제보는 {core.UNVERIFIED_W}건으로 계산, 다른 사람 같은 제보나 지킴이 확인이 있으면 1건 · "
+               "허위 판정은 제외")
     st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1 "
                "(버려진 어구 = 해양생물 위협 1위, Wilcox 외 2016)\n\n"
                "돌고래: 대정 1.0(2025 보호구역) · 안덕·구좌 0.5(2026 보도)")
 
-table = core.build_table(beaches, st.session_state.reports, winter, records,
+if "sid" not in st.session_state:          # 익명 세션 표시(개인정보 아님): 같은 사람의 중복 제보 구분용
+    st.session_state.sid = store_mod.new_id()[:12]
+REPORTS = core.apply_reviews(st.session_state.reports, st.session_state.reviews)   # 검토 결과 반영본
+
+table = core.build_table(beaches, REPORTS, winter, records,
                          today=TODAY, cleanups=st.session_state.cleanups)
 
 zones = load_zones(zones_mtime())
@@ -258,7 +265,8 @@ with tab_map:
 
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("지도 지점", len(table))
-    c2.metric("최근 근거 지점", int((table.status == "최근 근거").sum()))
+    c2.metric("최근 근거 지점", int(table.status.str.startswith("최근 근거").sum()),
+              help="'검토 대기'는 검토 전 시민 제보만 있는 지점(현장 확인 필요)")
     c3.metric("재확인 필요", int(table.status.str.contains("재확인").sum()))
     c4.metric("수거 완료", int((table.status == "수거 완료").sum()))
     c5.metric("확인 기록 없음", int((table.status == core.NO_CHECK).sum()))
@@ -316,7 +324,8 @@ with tab_map:
                f"{'' if pd.isna(r.freshness) else f' (최신성 {r.freshness:.2f})'}<br>"
                f"보정 위해성: {'-' if pd.isna(r.adj_hazard) else f'{r.adj_hazard:.2f}'}"
                f" (원래 {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'})<br>"
-               f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}<br>"
+               f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}"
+               + (f" (검토 대기 {r.unverified}묶음)" if r.unverified else "") + "<br>"
                f"마을어장 인접: {'예' if r.village_fishery else '아니오'}<br>"
                f"돌고래 가중치: {r.dolphin_weight}"
                + (f" ({r.dolphin_basis})" if isinstance(r.dolphin_basis, str) and r.dolphin_basis else ""))
@@ -437,24 +446,29 @@ with tab_report:
             new_rep = dict(
                 time=now_kst().strftime("%Y-%m-%d %H:%M:%S"), place=place, lat=round(lat, 5), lon=round(lon, 5),
                 emd=emd, category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
-                attach_to_name=attach, ai=bool(ai) and cat == ai["category"])
+                attach_to_name=attach, ai=bool(ai) and cat == ai["category"], sid=st.session_state.sid)
             recent = [t for t in st.session_state.get("my_report_times", []) if time.time() - t < 600]
+            dup = core.find_duplicate(REPORTS, new_rep)
             problem = core.valid_report(new_rep) or (
-                "10분에 제보 10건까지 받아요. 잠시 후 다시 해주세요." if len(recent) >= 10 else None)
+                "10분에 제보 10건까지 받아요. 잠시 후 다시 해주세요." if len(recent) >= 10 else None) or (
+                f"이미 같은 곳에 같은 종류를 제보했어요 ({dup['time'][:16]}). 중복 제보는 한 번만 반영돼요."
+                if dup and dup.get("sid") == st.session_state.sid else None)
             if problem:
                 st.session_state.flash_err = problem
                 st.rerun()
             st.session_state.my_report_times = recent + [time.time()]
             persist("reports", new_rep)
             st.session_state.pop("ai", None)
-            new = core.build_table(beaches, st.session_state.reports, winter, records,
-                                   today=TODAY, cleanups=st.session_state.cleanups)
+            new = core.build_table(beaches, core.apply_reviews(st.session_state.reports, st.session_state.reviews),
+                                   winter, records, today=TODAY, cleanups=st.session_state.cleanups)
             after, _ = core.nearest_point(new, lat, lon)     # 이름이 '#2'로 바뀌어도 위치로 찾음
             place = after["name"]
             st.session_state.stamps.add(place)
             score_txt = "-" if pd.isna(after.risk_index) else f"{after.risk_index:.2f}"
             st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {score_txt} · "
-                                      f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요.")
+                                      f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요."
+                                      + ("  \n👥 다른 분이 24시간 안에 같은 곳·같은 종류를 제보해서 **한 건으로 합치고 '확인됨'**으로 올렸어요."
+                                         if dup else "  \n⏳ 다른 사람의 같은 제보나 지킴이 확인이 있으면 점수에 온전히 반영돼요."))
             st.rerun()                     # 지도·리포트에 바로 반영
 
     if st.session_state.stamps:
@@ -478,13 +492,14 @@ with tab_list:
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)")
     rep = core.priority(table, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
-        ["순위", "name", "emd", "risk_index", "adj_hazard", "evidence", "record_count", "report_count",
+        ["순위", "name", "emd", "risk_index", "status", "adj_hazard", "evidence", "record_count", "report_count",
          "village_fishery", "dolphin_basis"]]
     rep["adj_hazard"] = rep["adj_hazard"].round(2)
-    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "보정 위해성", "근거 수", "기관 기록", "제보 수",
+    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "보정 위해성", "근거 수", "기관 기록", "제보 수",
                    "마을어장 인접", "돌고래 근거"]
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
-    st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다.")
+    st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다. "
+               "**'검토 대기'** 는 검토 전 시민 제보만 있는 곳이라, 출동 전에 아래 🛡️ 제보 검토에서 사진·현장을 확인하세요.")
     st.dataframe(rep, hide_index=True, use_container_width=True)
     st.download_button("📥 지킴이 전달용 CSV 다운로드", rep.to_csv(index=False).encode("utf-8-sig"),
                        file_name=f"우선수거구역_{now_kst():%Y%m%d}.csv", mime="text/csv")
@@ -587,12 +602,43 @@ with tab_list:
                    "**원래 위험도**(시간 감쇠를 빼고 본 점수)가 높은 곳부터 가면 됩니다. "
                    "가 봤더니 깨끗했다면 위 **🧭 순찰 확인 기록**에서 그 해안 구역을 '이상 없음'으로 기록하세요 → 수거 완료로 처리됩니다.")
 
-    if st.session_state.reports:
-        st.markdown("#### 제보 기록")
-        rl = pd.DataFrame(st.session_state.reports).reindex(columns=["time", "place", "emd", "category", "ai"])
+    if REPORTS:
+        st.divider()
+        st.markdown("#### 🛡️ 제보 검토 (허위·중복 제보 관리)")
+        pend = [r for r in REPORTS if not r.get("review")]
+        st.caption(f"검토 대기 {len(pend)}건. 같은 곳·같은 종류 {core.DUP_HOURS}시간 내 제보는 자동으로 1건으로 묶이고, "
+                   f"검토 전 제보는 점수에 {core.UNVERIFIED_W}건으로만 들어갑니다. 지킴이가 현장·사진을 보고 "
+                   "**사실 확인**하면 1건, **허위**로 처리하면 점수와 확인 기록에서 빠집니다.")
+        VERDICT = {"ok": "✅ 확인", "reject": "🚫 허위", None: "⏳ 대기"}
+        rl = pd.DataFrame(REPORTS).reindex(columns=["time", "place", "emd", "category", "ai", "review"])
         rl["category"] = rl["category"].map(lambda c: core.LABEL.get(c, c))
-        rl.columns = ["시각", "장소", "읍면동", "종류", "AI 판별"]
+        rl["review"] = rl["review"].map(lambda v: VERDICT.get(v if isinstance(v, str) else None))
+        rl["ai"] = rl["ai"].map(lambda v: "예" if v is True else "")
+        rl.columns = ["시각", "장소", "읍면동", "종류", "AI 판별", "검토"]
         st.dataframe(rl.iloc[::-1].fillna(""), hide_index=True, use_container_width=True)
+        if pend:
+            label = {r["_id"]: f"{str(r.get('time', ''))[:16]} · {r.get('place', '')} · {core.LABEL.get(r.get('category'), '')}"
+                     for r in pend}
+            rv1, rv2, rv3, rv4 = st.columns([3, 2, 1, 1])
+            pick = rv1.selectbox("검토할 제보 (최신순)", [r["_id"] for r in reversed(pend)], format_func=label.get,
+                                 key="review_pick")
+            rnote = core.scrub_memo(rv2.text_input("검토 메모 (선택)", key="review_note", max_chars=core.MEMO_MAX,
+                                                   placeholder="예: 현장 확인, 사진과 다름"))
+            rv3.write("")
+            rv4.write("")
+            verdict = ("ok" if rv3.button("✅ 사실 확인", use_container_width=True, disabled=not keeper) else
+                       "reject" if rv4.button("🚫 허위", use_container_width=True, disabled=not keeper) else None)
+            if verdict:
+                persist("reviews", {"report": pick, "verdict": verdict, "by": rnote,
+                                    "logged": now_kst().strftime("%Y-%m-%d %H:%M:%S")})
+                st.session_state.flash_review = f"{VERDICT[verdict]} 처리했어요: {label[pick]}"
+                st.rerun()
+        if st.session_state.get("flash_review"):
+            st.success(st.session_state.pop("flash_review"))
+        last_rv = my_last("reviews")
+        if keeper and last_rv and st.button("↩️ 내가 한 마지막 검토 되돌리기"):
+            drop("reviews", [last_rv["_id"]])
+            st.rerun()
 
 # ---------------- 4. 가중치 검증 ----------------
 with tab_check:
@@ -611,7 +657,7 @@ with tab_check:
     w = core.default_weights()
     w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl, seaweed=ot, other=ot)
     w.update(dolphin_scale=ds, fishery=fi, prior_k=kk, hl_event=hl)
-    custom = core.build_table(beaches, st.session_state.reports, winter, records, w,
+    custom = core.build_table(beaches, REPORTS, winter, records, w,
                               today=TODAY, cleanups=st.session_state.cleanups)
     base_t = table[table.risk_index.notna()].set_index("name")
     cus_t = custom[custom.risk_index.notna()].set_index("name")
@@ -625,7 +671,7 @@ with tab_check:
 
     st.divider()
     st.markdown("#### 자동 민감도 분석")
-    rb_args = (json.dumps(st.session_state.reports, ensure_ascii=False),
+    rb_args = (json.dumps(REPORTS, ensure_ascii=False),
                json.dumps(st.session_state.cleanups, ensure_ascii=False), winter, TODAY.isoformat())
     if st.session_state.get("rb_args") != rb_args:
         st.caption("가중치 조합 수백 개로 순위를 다시 계산합니다. 제보·수거 기록이 바뀌면 다시 눌러 주세요.")

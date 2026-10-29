@@ -10,6 +10,7 @@
 
 ## 점수
 - 현재 위험 지수 = 보정 위해성 × (1 + 돌고래) × 마을어장 × 계절 × 최신성
+- 근거 수는 유효 근거 수(검토 전 제보 0.5건, 중복 제보는 1건으로 묶음)
 - 최신성: 근거가 오래될수록 가볍게 (반감기 공공 조사 3년, 기관 기록·시민 제보 180일)
 - 수거 완료 처리: 완료일 이전 근거는 현재 점수에서 빠지고, 이후 새 근거가 들어오면 다시 순위에 올라옴
 - 보정 위해성 = (근거별 위해성 합 + 1×2) ÷ (근거 수 + 1) — 근거가 적은 지점이 한 건으로 튀지 않게 중간값(2) 쪽으로 당기는 축소 추정
@@ -42,7 +43,7 @@
 ```sql
 create table if not exists public.events (
   id text primary key,
-  kind text not null check (kind in ('reports', 'cleanups', 'patrols')),
+  kind text not null check (kind in ('reports', 'cleanups', 'patrols', 'reviews')),
   data jsonb not null,
   created_at timestamptz not null default now()
 );
@@ -57,6 +58,18 @@ SUPABASE_KEY = "sb_secret_..."
 ```
 secret 키는 서버(Streamlit)에서만 쓰이고 브라우저로 나가지 않습니다. 테이블은 RLS가 켜져 있어 공개 키로는 읽고 쓸 수 없습니다.
 무료 플랜은 1주일 동안 사용이 없으면 일시 정지되므로, 시연 전에 대시보드에서 상태를 확인하세요.
+
+## 허위·중복 제보 대책
+- 같은 지점(같은 해변 또는 300m 이내)·같은 종류·24시간 안의 제보는 근거 1건으로 묶음 → 같은 제보를 여러 번 해도 점수가 부풀지 않음
+- 같은 사람(익명 세션)이 같은 곳·같은 종류를 24시간 안에 다시 제보하면 거절
+- 검토 전 제보는 0.5건으로 계산. 다른 사람이 같은 제보를 하거나 지킴이가 '사실 확인'하면 1건, '허위'면 점수·확인 기록에서 제외
+- 검토 전 제보만 있는 지점은 '최근 근거 · 검토 대기'로 표시해 출동 전 확인을 유도
+- 기존 DB에는 아래 SQL을 한 번 실행해 검토 기록(reviews)을 허용
+```sql
+alter table public.events drop constraint if exists events_kind_check;
+alter table public.events add constraint events_kind_check
+  check (kind in ('reports', 'cleanups', 'patrols', 'reviews'));
+```
 
 ## 개인정보·보안
 - 수집하지 않음: 이름·연락처·계정, 사진(저장 안 함), 기기 GPS. 위치는 사용자가 지도에서 고른 쓰레기 위치만 저장

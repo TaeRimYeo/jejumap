@@ -32,6 +32,8 @@ PRIOR_K = 1.0
 HALF_LIFE_PUBLIC = 1095   # 3년
 HALF_LIFE_EVENT = 180     # 6개월
 PUBLIC_DATE = "2021-12-31"   # 2021년 연 6회 조사의 마지막 시점으로 잡음
+UNVERIFIED_W = 0.5      # 검토 전 시민 제보 1건의 무게 (지킴이 확인 또는 다른 사람 같은 제보가 있으면 1)
+DUP_HOURS = 24          # 같은 지점·같은 종류 제보를 한 건으로 묶는 시간 창
 NO_CHECK = "확인 기록 없음"   # 근거가 하나도 없는 지점·구역 ('깨끗함'이 아님)
 SOURCE_LABEL = {"public": "공공 조사(2021)", "record": "기관·언론 기록(2025~26)", "report": "시민 제보"}
 
@@ -164,7 +166,8 @@ def _evidence_items(beaches, reports, records):
                           at=_to_dt(rep.get("time")),
                           place=rep["place"], emd=rep["emd"], lat=rep["lat"], lon=rep["lon"],
                           attach_name=rep.get("attach_to_name"), attach_idx=rep.get("attach_to"),
-                          rid=rep.get("_id"), near_fishery=rep.get("near_fishery")))
+                          rid=rep.get("_id"), sid=rep.get("sid") or rep.get("_id"), review=rep.get("review"),
+                          near_fishery=rep.get("near_fishery")))
     return items
 
 
@@ -176,6 +179,8 @@ def build_structure(beaches, reports, records=None):
             if pd.notna(h) else []
             for h in t["hazard_index"]]
     for it in _evidence_items(beaches, reports, records):
+        if it.get("review") == "reject":       # 지킴이가 허위로 판정한 제보는 근거에서 제외
+            continue
         idx = None
         if isinstance(it.get("attach_name"), str) and (t.name == it["attach_name"]).any():
             idx = t.index[t.name == it["attach_name"]][0]
@@ -188,6 +193,8 @@ def build_structure(beaches, reports, records=None):
         e = {"source": it["source"], "category": it["category"], "date": it["date"], "at": it["at"],
              "lat": it.get("lat") if pd.notna(it.get("lat")) else None,
              "lon": it.get("lon") if pd.notna(it.get("lon")) else None}
+        if it["source"] == "report":
+            e.update(rid=it.get("rid"), sid=it.get("sid"), review=it.get("review"))
         if idx is not None:
             evid[idx].append(e)
         else:
@@ -206,6 +213,58 @@ def build_structure(beaches, reports, records=None):
             evid.append([e])
     t["evid"] = evid
     return t
+
+
+def apply_reviews(reports, reviews):
+    """제보마다 가장 최근 검토 결과(ok=확인, reject=허위)를 붙인 사본."""
+    last = {}
+    for rv in sorted(reviews or [], key=lambda r: str(r.get("logged", ""))):
+        last[rv.get("report")] = rv.get("verdict")
+    return [dict(r, review=last.get(r.get("_id"))) for r in reports or []]
+
+
+def find_duplicate(reports, new, meters=300, hours=DUP_HOURS):
+    """새 제보와 같은 종류·가까운 곳(같은 해변 또는 300m 이내)·24시간 이내인 기존 제보 (없으면 None)."""
+    t_new = _to_dt(new.get("time"))
+    best = None
+    for r in reports or []:
+        if r.get("review") == "reject" or r.get("category") != new.get("category"):
+            continue
+        t = _to_dt(r.get("time"))
+        if not (t and t_new) or abs((t_new - t).total_seconds()) > hours * 3600:
+            continue
+        same_place = (new.get("attach_to_name") and r.get("attach_to_name") == new.get("attach_to_name")) or \
+            haversine_m(r["lat"], r["lon"], new["lat"], new["lon"]) <= meters
+        if same_place and (best is None or t > _to_dt(best.get("time"))):
+            best = r
+    return best
+
+
+def merge_reports(evs):
+    """같은 지점·같은 종류·24시간 안의 시민 제보를 근거 1건으로 묶는다(중복 제보로 점수가 부풀지 않게).
+    묶음의 무게: 지킴이 확인 또는 서로 다른 사람 2명 이상 → 1, 아니면 UNVERIFIED_W.
+    공공 조사·기관 기록은 그대로(무게 1)."""
+    out = [dict(e, w=1.0, n_reports=0) for e in evs if e["source"] != "report"]
+    by_cat = {}
+    for e in evs:
+        if e["source"] == "report":
+            by_cat.setdefault(e["category"], []).append(e)
+    for cat, items in by_cat.items():
+        items.sort(key=lambda e: (e["at"] or _dt.datetime.min))
+        groups = []
+        for e in items:
+            g = groups[-1] if groups else None
+            if g and e["at"] and g[0]["at"] and (e["at"] - g[0]["at"]).total_seconds() <= DUP_HOURS * 3600:
+                g.append(e)
+            else:
+                groups.append([e])
+        for g in groups:
+            sids = {x.get("sid") for x in g}
+            ok = any(x.get("review") == "ok" for x in g) or len(sids) >= 2
+            newest = max(g, key=lambda x: x["at"] or _dt.datetime.min)
+            out.append(dict(newest, w=1.0 if ok else UNVERIFIED_W, n_reports=len(g), verified=ok,
+                            ids=[x.get("rid") for x in g]))
+    return out
 
 
 def last_cleanups(cleanups):
@@ -232,24 +291,27 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
     rows = t.to_dict("records")
     cols = {k: [] for k in ("public_evidence", "record_count", "report_count", "evidence", "avg_hazard",
                             "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history", "potential",
-                            "last_seen")}
+                            "last_seen", "unverified", "weight")}
     risks = []
     for r in rows:
         cut = done.get(r["name"])
         all_ev = r["evid"]
-        act = [e for e in all_ev if cut is None or (e["at"] is not None and e["at"] > cut)]
+        act = merge_reports([e for e in all_ev if cut is None or (e["at"] is not None and e["at"] > cut)])
         sens = sensitivity(r["emd"], r["village_fishery"], r["coast_side"], winter_on, w)
         if all_ev:   # 순찰 우선순위용: 최신성·수거 여부를 빼고 본 원래 위험도
-            hs_all = [public_hazard(r, w) if e["source"] == "public" else hz[e["category"]] for e in all_ev]
-            n_all = len(all_ev)
+            m_all = merge_reports(all_ev)
+            hs_all = [(public_hazard(r, w) if e["source"] == "public" else hz[e["category"]]) * e["w"] for e in m_all]
+            n_all = sum(e["w"] for e in m_all)
             cols["potential"].append(round((sum(hs_all) + w["prior_k"] * w["prior_m"]) / (n_all + w["prior_k"]) * sens, 2))
         else:
             cols["potential"].append(float("nan"))
         cnt = {s: sum(e["source"] == s for e in act) for s in ("public", "record", "report")}
         cols["public_evidence"].append(cnt["public"])
         cols["record_count"].append(cnt["record"])
-        cols["report_count"].append(cnt["report"])
+        cols["report_count"].append(sum(e.get("n_reports", 0) for e in act))
+        cols["unverified"].append(sum(1 for e in act if e["source"] == "report" and not e.get("verified")))
         cols["evidence"].append(len(act))
+        cols["weight"].append(round(sum(e["w"] for e in act), 2))
         cols["history"].append(len(all_ev))
         cols["last_cleanup"].append(cut.date().isoformat() if cut else "")
         seen = [e["date"] for e in all_ev if e["date"]] + ([cut.date()] if cut else [])
@@ -266,12 +328,13 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
                 cols["status"].append("수거 완료")
             risks.append(float("nan"))
             continue
-        hs, ds = [], []
+        hs, ds, ws = [], [], []
         for e in act:
             hs.append(public_hazard(r, w) if e["source"] == "public" else hz[e["category"]])
             ds.append(decay(e["source"], e["date"] or today, today, w))
-        n = len(act)
-        hbar = sum(h * d for h, d in zip(hs, ds)) / sum(ds)
+            ws.append(e["w"])
+        n = sum(ws)                                   # 유효 근거 수 (검토 전 제보는 0.5건)
+        hbar = sum(h * d * v for h, d, v in zip(hs, ds, ws)) / sum(d * v for d, v in zip(ds, ws))
         adj = (n * hbar + w["prior_k"] * w["prior_m"]) / (n + w["prior_k"])
         fresh = max(ds)
         last = max(e["date"] for e in act if e["date"])
@@ -279,7 +342,11 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
         cols["adj_hazard"].append(adj)
         cols["freshness"].append(fresh)
         cols["last_date"].append(last.isoformat())
-        cols["status"].append("최근 근거" if fresh >= 0.5 else "오래된 근거 · 재확인 필요")
+        only_unverified = all(e["source"] == "report" and not e.get("verified") for e in act)
+        if fresh < 0.5:
+            cols["status"].append("오래된 근거 · 재확인 필요")
+        else:
+            cols["status"].append("최근 근거 · 검토 대기" if only_unverified else "최근 근거")   # 검토 전 제보뿐인 곳
         risks.append(round(adj * sens * fresh, 2))
     for k, v in cols.items():
         t[k] = v
