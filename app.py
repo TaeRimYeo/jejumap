@@ -197,7 +197,8 @@ with tab_map:
     else:
         show_zones = False
 
-    m = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap")
+    m = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap",
+                   scrollWheelZoom=False)   # 페이지를 내리다 지도가 확대·축소되지 않게 (+/- 버튼으로 조절)
     if show_zones:
         info = cov.set_index("zone_id")
         feats = []
