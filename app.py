@@ -42,7 +42,7 @@ def load_records_df():
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner="160개 가중치 조합으로 다시 계산 중...")
+@st.cache_data(show_spinner="가중치 조합 수백 개로 다시 계산 중... (처음 한 번만 걸려요)")
 def cached_robustness(reports_json, winter_on):
     return core.robustness(load_beaches(), json.loads(reports_json), load_records_df().to_dict("records"), winter_on)
 
@@ -88,8 +88,10 @@ with st.sidebar:
     else:
         st.caption("AI 키가 없어요. 제보 화면에서 종류를 직접 고르면 됩니다.")
     st.divider()
-    st.markdown("**위험 지수**  \n= 평균 위해성 × (1+돌고래) × 마을어장 × 계절  \n"
+    st.markdown("**위험 지수**  \n= 보정 위해성 × (1+돌고래) × 마을어장 × 계절  \n"
+                "**보정 위해성** = (근거 위해성 합 + 2) ÷ (근거 수 + 1)  \n"
                 "**근거 수** = 공공 조사 + 기관·언론 기록 + 시민 제보")
+    st.caption("근거가 1건뿐인 곳은 중간값(2)과 반반 섞어서, 제보 한 건으로 순위가 튀지 않게 합니다.")
     st.caption("위해성: 폐어구 3 · 플라스틱/스티로폼 2 · 해조류/기타 1 "
                "(버려진 어구 = 해양생물 위협 1위, Wilcox 외 2016)\n\n"
                "돌고래: 대정 1.0(2025 보호구역) · 안덕·구좌 0.5(2026 보도)")
@@ -131,7 +133,8 @@ with tab_map:
         tip = f"{r.name} · " + ("미측정 (제보 필요)" if pd.isna(score) else f"위험 지수 {score:.2f} · 근거 {r.evidence}건")
         pop = (f"<b>{r.name}</b> ({r.type})<br>"
                f"위험 지수: {'미측정' if pd.isna(score) else f'{score:.2f}'}<br>"
-               f"평균 위해성: {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'}<br>"
+               f"보정 위해성: {'-' if pd.isna(r.adj_hazard) else f'{r.adj_hazard:.2f}'}"
+               f" (원래 {'-' if pd.isna(r.avg_hazard) else f'{r.avg_hazard:.2f}'})<br>"
                f"근거: 공공 조사 {r.public_evidence} · 기관 기록 {r.record_count} · 시민 제보 {r.report_count}<br>"
                f"마을어장 인접: {'예' if r.village_fishery else '아니오'}<br>"
                f"돌고래 가중치: {r.dolphin_weight}"
@@ -244,9 +247,10 @@ with tab_list:
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)")
     rep = core.priority(table, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
-        ["순위", "name", "emd", "risk_index", "avg_hazard", "evidence", "record_count", "report_count",
+        ["순위", "name", "emd", "risk_index", "adj_hazard", "evidence", "record_count", "report_count",
          "village_fishery", "dolphin_basis"]]
-    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "평균 위해성", "근거 수", "기관 기록", "제보 수",
+    rep["adj_hazard"] = rep["adj_hazard"].round(2)
+    rep.columns = ["순위", "지점", "읍면동", "위험 지수", "보정 위해성", "근거 수", "기관 기록", "제보 수",
                    "마을어장 인접", "돌고래 근거"]
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다.")
@@ -271,9 +275,10 @@ with tab_check:
     with b:
         ds = st.slider("돌고래 가중치 배율 (0 = 돌고래 무시)", 0.0, 2.0, 1.0, 0.25)
         fi = st.slider("마을어장 인접 배율", 1.0, 2.0, core.FISHERY_W, 0.25)
+        kk = st.slider("근거 수 보정 강도 (0 = 보정 없음)", 0.0, 3.0, core.PRIOR_K, 0.5)
     w = core.default_weights()
     w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl, seaweed=ot, other=ot)
-    w.update(dolphin_scale=ds, fishery=fi)
+    w.update(dolphin_scale=ds, fishery=fi, prior_k=kk)
     custom = core.build_table(beaches, st.session_state.reports, winter, records, w)
     base_t = table[table.risk_index.notna()].set_index("name")
     cus_t = custom[custom.risk_index.notna()].set_index("name")
@@ -293,8 +298,11 @@ with tab_check:
     m2.metric("기본 순위와 평균 순위상관", f"{summ['rho_mean']:.2f}")
     m3.metric("가장 다른 조합의 순위상관", f"{summ['rho_min']:.2f}")
     st.dataframe(rb, hide_index=True, use_container_width=True)
-    st.caption("폐어구 2~5, 플라스틱·스티로폼 1.5~2.5, 돌고래 배율 0~1.5, 마을어장 1~2를 조합해 다시 계산했습니다 "
-               "(폐어구가 가장 위험하다는 전제는 유지). 순위상관은 1에 가까울수록 순위가 그대로라는 뜻입니다.")
+    st.caption("폐어구 2~5, 플라스틱·스티로폼 1.5~2.5, 돌고래 배율 0~1.5, 마을어장 1~2, 근거 수 보정 0~2를 조합해 "
+               "다시 계산했습니다 (폐어구가 가장 위험하다는 전제는 유지). 순위상관은 1에 가까울수록 순위가 그대로라는 뜻입니다.")
+    st.info("**읽는 법:** 상위 3 유지율이 100%인 지점은 가중치를 어떻게 바꿔도 우선 수거 대상입니다. "
+            "김녕리처럼 유지율이 낮은 지점은 돌고래 근거가 순위를 끌어올리는 곳이라, 돌고래 배율을 0으로 두면 내려갑니다. "
+            "공식을 숨기지 않고 어떤 요소가 순위를 만드는지 보여주는 화면입니다.")
 
     st.divider()
     st.markdown("#### 요소 간 중복 점검")
@@ -303,5 +311,5 @@ with tab_check:
     if not corr.empty and corr.shape[0] > 1:
         st.caption(f"근거가 있는 {n}개 지점에서 요소 간 상관계수")
         st.dataframe(corr, use_container_width=True)
-    st.caption("마을어장은 제주 해안 대부분에 있어 지점을 거의 구분하지 못합니다. 그래서 순위를 정하는 힘은 "
-               "주로 쓰레기 위해성과 돌고래 근거에서 나옵니다.")
+    st.caption("마을어장은 제주 해안 대부분에 있어 지점을 거의 구분하지 못합니다(구분력 약함). 그래서 순위를 정하는 힘은 "
+               "주로 쓰레기 위해성과 돌고래 근거에서 나옵니다. 지점 수가 적어 상관계수는 참고용입니다.")

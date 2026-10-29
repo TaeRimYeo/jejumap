@@ -23,12 +23,25 @@ WINTER_NW_W = 1.2    # 겨울 북서계절풍: 북·서쪽 해안 가중
 ATTACH_M = 1000      # 기존 지점에서 이 거리 안이면 같은 지점으로 묶음
 EMD_LIST = ["구좌읍", "조천읍", "삼양동", "화북동", "건입동", "이호동", "애월읍", "한림읍", "한경면", "대정읍",
             "안덕면", "중문동", "서귀포시 동지역", "남원읍", "표선면", "성산읍", "기타"]
+# 근거 수 보정: 근거가 적은 지점의 평균 위해성을 중간값(플라스틱 수준 2) 쪽으로 당긴다.
+# 보정 위해성 = (근거 위해성 합 + K×M) / (근거 수 + K). 근거 1건이면 중간값과 반반 섞임.
+PRIOR_M = 2.0
+PRIOR_K = 1.0
 SOURCE_LABEL = {"public": "공공 조사(2021)", "record": "기관·언론 기록(2025~26)", "report": "시민 제보"}
 
 
 def default_weights():
     """가중치 묶음. 민감도 분석에서 이 값을 바꿔 가며 순위를 다시 계산한다."""
-    return {"hazard": dict(HAZARD), "dolphin_scale": 1.0, "fishery": FISHERY_W, "winter": WINTER_NW_W}
+    return {"hazard": dict(HAZARD), "dolphin_scale": 1.0, "fishery": FISHERY_W, "winter": WINTER_NW_W,
+            "prior_k": PRIOR_K, "prior_m": PRIOR_M}
+
+
+def adjusted_hazard(hz_sum, n, w=None):
+    """근거 수 보정 평균 위해성."""
+    w = w or default_weights()
+    if not n:
+        return float("nan")
+    return (hz_sum + w["prior_k"] * w["prior_m"]) / (n + w["prior_k"])
 
 
 def dolphin_weight(emd, w=None):
@@ -114,17 +127,14 @@ def _evidence_items(beaches, reports, records):
     return items
 
 
-def build_table(beaches, reports, winter_on, records=None, w=None):
-    """지점별 위험 지수와 근거 수.
-    평균 위해성 = (공공 조사 1건 + 기관 기록 + 시민 제보) 각 근거 위해성의 평균
-    근거 수    = 공공 조사 + 기관 기록 + 시민 제보 건수"""
-    w = w or default_weights()
-    hz = w["hazard"]
+def build_structure(beaches, reports, records=None):
+    """어떤 근거가 어느 지점에 붙는지 (가중치와 무관하므로 한 번만 계산).
+    각 지점에 붙은 기록·제보의 쓰레기 종류 목록을 cats 열에 담는다."""
     t = beaches.copy().reset_index(drop=True)
     t["public_evidence"] = t["hazard_index"].notna().astype(int)
-    t["hz_sum"] = [public_hazard(r, w) if p else 0.0 for r, p in zip(t.to_dict("records"), t.public_evidence)]
     t["record_count"] = 0
     t["report_count"] = 0
+    cats = [[] for _ in range(len(t))]
     for it in _evidence_items(beaches, reports, records):
         idx = None
         if it.get("attach_idx") is not None and it["attach_idx"] in t.index:
@@ -138,23 +148,42 @@ def build_table(beaches, reports, winter_on, records=None, w=None):
         col = "record_count" if it["source"] == "record" else "report_count"
         if idx is not None:
             t.loc[idx, col] += 1
-            t.loc[idx, "hz_sum"] += hz[it["category"]]
+            cats[idx].append(it["category"])
         else:
-            near, _ = nearest_point(beaches, it["lat"], it["lon"])
             fishery = it["near_fishery"] if it["near_fishery"] is not None else True  # 제주 해안 대부분 마을어장
             row = dict(name=it["place"], type="기관 기록" if it["source"] == "record" else "시민제보",
                        emd=it["emd"], lat=it["lat"], lon=it["lon"], coast_side=coast_side(it["lat"], it["lon"]),
                        has_debris_data=False, village_fishery=fishery,
                        dolphin_weight=DOLPHIN.get(it["emd"], (0.0, ""))[0],
                        dolphin_basis=DOLPHIN.get(it["emd"], (0, ""))[1],
-                       public_evidence=0, hz_sum=float(hz[it["category"]]), record_count=0, report_count=0)
+                       public_evidence=0, record_count=0, report_count=0)
             row[col] = 1
             t = pd.concat([t, pd.DataFrame([row])], ignore_index=True)
+            cats.append([it["category"]])
+    t["cats"] = cats
     t["evidence"] = t["public_evidence"] + t["record_count"] + t["report_count"]
+    return t
+
+
+def score_structure(struct, winter_on, w=None):
+    """구조에 가중치를 적용해 위험 지수 계산."""
+    w = w or default_weights()
+    hz = w["hazard"]
+    t = struct.copy()
+    t["hz_sum"] = [(public_hazard(r, w) if p else 0.0) + sum(hz[c] for c in cs)
+                   for r, p, cs in zip(t.to_dict("records"), t.public_evidence, t.cats)]
     t["avg_hazard"] = (t["hz_sum"] / t["evidence"]).where(t["evidence"] > 0)
-    t["risk_index"] = [risk_index(r.avg_hazard, r.emd, r.village_fishery, r.coast_side, winter_on, w)
+    t["adj_hazard"] = [adjusted_hazard(h, n, w) for h, n in zip(t.hz_sum, t.evidence)]
+    t["risk_index"] = [risk_index(r.adj_hazard, r.emd, r.village_fishery, r.coast_side, winter_on, w)
                        for r in t.itertuples()]
     return t
+
+
+def build_table(beaches, reports, winter_on, records=None, w=None):
+    """지점별 위험 지수와 근거 수.
+    보정 위해성 = (공공 조사 1건 + 기관 기록 + 시민 제보 위해성 합 + K×M) / (근거 수 + K)
+    근거 수    = 공공 조사 + 기관 기록 + 시민 제보 건수"""
+    return score_structure(build_structure(beaches, reports, records), winter_on, w)
 
 
 def priority(table, n=5):
@@ -165,7 +194,7 @@ def priority(table, n=5):
 def rank_compare(beaches):
     """개수 기준 순위 vs 위험 지수 순위 (공공데이터 측정 지점만)."""
     m = beaches[beaches.has_debris_data].copy()
-    m["위험 지수"] = [risk_index(r.hazard_index, r.emd, r.village_fishery, r.coast_side, False)
+    m["위험 지수"] = [risk_index(adjusted_hazard(r.hazard_index, 1), r.emd, r.village_fishery, r.coast_side, False)
                   for r in m.itertuples()]
     m["개수 순위"] = m.total_items.rank(ascending=False, method="min").astype(int)
     m["위험 지수 순위"] = m["위험 지수"].rank(ascending=False, method="min").astype(int)
@@ -192,26 +221,28 @@ def scenario_grid():
     for fg in (2, 3, 4, 5):
         for pl in (1.5, 2, 2.5):
             for ds in (0.0, 0.5, 1.0, 1.5):
-                for fi in (1.0, 1.25, 1.5, 2.0):
-                    if pl >= fg:
-                        continue          # '폐어구가 가장 위험'이라는 전제는 유지
-                    w = default_weights()
-                    w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl)
-                    w.update(dolphin_scale=ds, fishery=fi)
-                    grid.append(w)
+                for fi in (1.0, 1.5, 2.0):
+                    for k in (0.0, 1.0, 2.0):
+                        if pl >= fg:
+                            continue          # '폐어구가 가장 위험'이라는 전제는 유지
+                        w = default_weights()
+                        w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl)
+                        w.update(dolphin_scale=ds, fishery=fi, prior_k=k)
+                        grid.append(w)
     return grid
 
 
 def robustness(beaches, reports, records, winter_on, top_k=3):
     """여러 가중치 조합에서 순위가 얼마나 유지되는지."""
-    base = build_table(beaches, reports, winter_on, records)
+    struct = build_structure(beaches, reports, records)
+    base = score_structure(struct, winter_on)
     base = base[base.risk_index.notna()]
     names = list(base.sort_values("risk_index", ascending=False).name)
     base_rank = base.set_index("name").risk_index.rank(ascending=False, method="min")
     ranks, rhos = {n: [] for n in names}, []
     grid = scenario_grid()
     for w in grid:
-        t = build_table(beaches, reports, winter_on, records, w)
+        t = score_structure(struct, winter_on, w)
         t = t[t.risk_index.notna()].set_index("name")
         r = t.risk_index.rank(ascending=False, method="min")
         for n in names:
@@ -232,7 +263,7 @@ def robustness(beaches, reports, records, winter_on, top_k=3):
 def factor_overlap(table):
     """요소 간 중복 점검: 각 요소가 지점을 얼마나 구분하는지와 요소 간 상관."""
     m = table[table.risk_index.notna()].copy()
-    f = pd.DataFrame({"평균 위해성": m.avg_hazard.astype(float),
+    f = pd.DataFrame({"보정 위해성": m.adj_hazard.astype(float),
                       "돌고래 가중치": m.dolphin_weight.astype(float),
                       "마을어장 인접": m.village_fishery.astype(float)})
     info = []
