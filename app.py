@@ -813,11 +813,11 @@ with tab_check:
 
     def _fmt(sm):
         return "-" if not sm["n"] else f"{sm['acc']:.0%}"
-    a1.metric("정답 사진 시험", _fmt(acc["test"]), f"{acc['test']['n']}장", delta_color="off",
+    a1.metric(f"정답 사진 시험 ({acc['test']['n']}장)", _fmt(acc["test"]),
               help="정답(종류)을 아는 사진을 AI에 보내 맞힌 비율. 가장 믿을 만한 근거")
-    a2.metric("현장: 지킴이 확인 제보", _fmt(acc["field_verified"]), f"{acc['field_verified']['n']}건", delta_color="off",
+    a2.metric(f"현장: 지킴이 확인 제보 ({acc['field_verified']['n']}건)", _fmt(acc["field_verified"]),
               help="AI 제안 종류와, 지킴이가 사실 확인한 제보의 최종 종류가 같은 비율")
-    a3.metric("현장: 전체 제보", _fmt(acc["field"]), f"{acc['field']['n']}건", delta_color="off",
+    a3.metric(f"현장: 전체 제보 ({acc['field']['n']}건)", _fmt(acc["field"]),
               help="AI 제안 종류를 제보자가 그대로 쓴 비율 (사람이 고쳐 쓴 경우 = 불일치)")
     st.caption(f"AI는 종류를 **추천만** 하고 최종 선택은 사람이 합니다. 확신이 {core.AI_MIN_CONF:.0%} 미만이면 "
                "추천을 기본값으로 고르지 않아요. 정확도는 아래 시험과 실제 제보가 쌓일수록 근거가 됩니다.")
