@@ -101,11 +101,11 @@ def _secret(name):
 
 
 @st.cache_resource
-def get_store(url, key):
+def get_store(url, key, version):     # store.py가 바뀌면(수정 시각) 새로 만듦
     return store_mod.open_store(url, key, BASE)
 
 
-store = get_store(_secret("SUPABASE_URL"), _secret("SUPABASE_KEY"))
+store = get_store(_secret("SUPABASE_URL"), _secret("SUPABASE_KEY"), (BASE / "store.py").stat().st_mtime)
 
 
 if "my_ids" not in st.session_state:       # 이 세션(이 사람)이 쓴 기록만 되돌릴 수 있게
@@ -138,7 +138,7 @@ def load_all(force=False):
             pending = {k: [] for k in store_mod.KINDS}
             st.session_state.store_error = str(e)
         for k in store_mod.KINDS:
-            st.session_state[k] = data[k] + pending[k]     # 아직 못 저장한 기록은 화면에 남김
+            st.session_state[k] = data.get(k, []) + pending.get(k, [])     # 아직 못 저장한 기록은 화면에 남김
 
 
 def persist(kind, rec):
