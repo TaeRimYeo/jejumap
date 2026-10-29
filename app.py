@@ -4,7 +4,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import folium
@@ -146,7 +146,14 @@ if "stamps" not in st.session_state:
     st.session_state.stamps = set()
 
 
-TODAY = datetime.now().date()
+KST = timezone(timedelta(hours=9))   # 서버(클라우드)는 UTC라서 한국 시간으로 맞춤
+
+
+def now_kst():
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+TODAY = now_kst().date()
 
 # ---------------- 사이드바 ----------------
 with st.sidebar:
@@ -376,7 +383,7 @@ with tab_report:
             fishery = bool(near.village_fishery) if dist <= 1000 else True  # 제주 해안 대부분 마을어장
             place = near["name"] if attach is not None else f"제보 지점 ({emd})"
             persist("reports", dict(
-                time=datetime.now().strftime("%Y-%m-%d %H:%M"), place=place, lat=lat, lon=lon, emd=emd,
+                time=now_kst().strftime("%Y-%m-%d %H:%M"), place=place, lat=lat, lon=lon, emd=emd,
                 category=cat, near_fishery=fishery, coast_side=core.coast_side(lat, lon),
                 attach_to=attach, ai=bool(ai)))
             st.session_state.pop("ai", None)
@@ -407,7 +414,7 @@ with tab_list:
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다.")
     st.dataframe(rep, hide_index=True, use_container_width=True)
     st.download_button("📥 지킴이 전달용 CSV 다운로드", rep.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"우선수거구역_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+                       file_name=f"우선수거구역_{now_kst():%Y%m%d}.csv", mime="text/csv")
 
     st.divider()
     st.markdown("#### ✅ 수거 완료 처리")
@@ -421,7 +428,7 @@ with tab_list:
         cc3.write("")
         if cc3.button("수거 완료", type="primary", use_container_width=True):
             persist("cleanups", {"site": site, "date": TODAY.isoformat(), "by": who,
-                                 "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
+                                 "logged": now_kst().strftime("%Y-%m-%d %H:%M")})
             st.session_state.flash_clean = f"✅ **{site}** 수거 완료 처리됨. 지도와 순위에서 내려갔어요."
             st.rerun()
     if st.session_state.get("flash_clean"):
@@ -447,7 +454,7 @@ with tab_list:
         full = cov[cov.state != "최근 확인"][["zone", "emd", "state", "sensitivity", "last_check", "lat", "lon"]]
         full.columns = ["해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "위도", "경도"]
         st.download_button(f"📥 확인 공백 구역 전체 {len(full)}곳 CSV", full.to_csv(index=False).encode("utf-8-sig"),
-                           file_name=f"확인공백구역_{datetime.now():%Y%m%d}.csv", mime="text/csv")
+                           file_name=f"확인공백구역_{now_kst():%Y%m%d}.csv", mime="text/csv")
 
         st.markdown("##### 🧭 순찰 확인 기록 (쓰레기 이상 없음)")
         st.caption("순찰했는데 쓰레기가 거의 없었다면 여기서 기록하세요. 이 구역은 '최근 확인'으로 바뀌어 공백 목록에서 빠지고, "
@@ -464,7 +471,7 @@ with tab_list:
         if clear:
             st.caption("이 구역의 재확인 필요 지점 → 함께 수거 완료 처리: **" + ", ".join(clear) + "**")
         if pz3.button("이상 없음 기록", use_container_width=True):
-            now = datetime.now()
+            now = now_kst()
             pid = now.strftime("%Y%m%d%H%M%S%f")
             logged = now.strftime("%Y-%m-%d %H:%M")
             persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
