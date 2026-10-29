@@ -114,8 +114,26 @@ for i in idx:
     feats.append({"type": "Feature",
                   "properties": {"zone_id": len(feats), "name": name, "sgg": r["sgg_nm"].replace("제주특별자치도 ", ""),
                                  "emd": emd, "lat": round(lat_c, 5), "lon": round(lon_c, 5),
-                                 "area_ha": float(r["area"]), "license": r["lcns_no"]},
+                                 "area_ha": float(r["area"]), "license": r["lcns_no"], "kind": "마을어장"},
                   "geometry": {"type": "Polygon", "coordinates": rings}})
+
+# 항만: 마을어장이 없는 부두·방파제 구간도 빠지지 않게 반경 800m 원으로 추가.
+# 제주의 무역항 2곳(제주·서귀포)과 연안항 4곳(한림·애월·화순·성산포). 위치는 항 중심 근사값.
+PORTS = [("제주항", "제주시", "제주시 동지역", 33.5215, 126.5440),
+         ("서귀포항", "서귀포시", "서귀포시 동지역", 33.2385, 126.5660),
+         ("한림항", "제주시", "한림읍", 33.4150, 126.2620),
+         ("애월항", "제주시", "애월읍", 33.4650, 126.3110),
+         ("화순항", "서귀포시", "안덕면", 33.2380, 126.3330),
+         ("성산포항", "서귀포시", "성산읍", 33.4740, 126.9300)]
+R_M = 800
+for nm, sgg, emd, la, lo in PORTS:
+    ring = [[round(lo + R_M * math.sin(t) / (111320 * math.cos(math.radians(la))), 5),
+             round(la + R_M * math.cos(t) / 110540, 5)] for t in (2 * math.pi * k / 36 for k in range(36))]
+    feats.append({"type": "Feature",
+                  "properties": {"zone_id": len(feats), "name": nm + " 일대", "sgg": sgg, "emd": emd,
+                                 "lat": la, "lon": lo, "area_ha": round(math.pi * R_M ** 2 / 1e4, 1), "license": "",
+                                 "kind": "항만"},
+                  "geometry": {"type": "Polygon", "coordinates": [ring]}})
 
 json.dump({"type": "FeatureCollection", "features": feats}, open(OUT, "w", encoding="utf-8"), ensure_ascii=False)
 print(len(feats), "zones", skipped)

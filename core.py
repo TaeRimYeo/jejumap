@@ -355,12 +355,14 @@ def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=No
     for i, z in enumerate(zones):
         p = z["properties"]
         side = coast_side(p["lat"], p["lon"])
-        sens = sensitivity(p["emd"], True, side, winter_on, w)    # 마을어장 구역이므로 어장 가중 적용
+        port = p.get("kind") == "항만"
+        sens = sensitivity(p["emd"], not port, side, winter_on, w)    # 마을어장 구역은 어장 가중, 항만은 제외
         hits = seen.get(i, [])
         last = max(d for d, _ in hits) if hits else None
         days = (today - last).days if last else None
         state = ZONE_STATES[0] if last is None else ZONE_STATES[1] if days > RECENT_CHECK_DAYS else ZONE_STATES[2]
-        out.append({"zone_id": p["zone_id"], "zone": p["name"], "emd": p["emd"], "lat": p["lat"], "lon": p["lon"],
+        out.append({"zone_id": p["zone_id"], "zone": p["name"], "kind": p.get("kind", "마을어장"),
+                    "emd": p["emd"], "lat": p["lat"], "lon": p["lon"],
                     "coast_side": side, "dolphin": dolphin_weight(p["emd"], w), "sensitivity": round(sens, 2),
                     "last_check": last.isoformat() if last else "", "days_since": days, "state": state,
                     "points": ", ".join(sorted({n for _, n in hits}))})
@@ -372,9 +374,20 @@ def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=No
     return df.drop(columns=["_o", "_d"]).reset_index(drop=True)
 
 
+def stale_points_in_zone(table, zones, zone_name):
+    """이 구역에 속한 '재확인 필요' 지점들. 순찰에서 이상 없음이면 수거 완료로 처리할 대상."""
+    idx = {z["properties"]["name"]: i for i, z in enumerate(zones)}.get(zone_name)
+    if idx is None:
+        return []
+    return [r.name for r in table.itertuples()
+            if "재확인" in r.status and nearest_zone(zones, r.lat, r.lon) == idx]
+
+
 def coverage_summary(cov):
     c = cov.state.value_counts()
-    return {s: int(c.get(s, 0)) for s in ZONE_STATES} | {"total": len(cov)}
+    k = cov.kind.value_counts()
+    return {s: int(c.get(s, 0)) for s in ZONE_STATES} | {"total": len(cov), "fishery": int(k.get("마을어장", 0)),
+                                                         "port": int(k.get("항만", 0))}
 
 
 def priority(table, n=5):

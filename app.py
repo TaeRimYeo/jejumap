@@ -183,7 +183,7 @@ with tab_map:
         cs = core.coverage_summary(cov)
         st.markdown("#### 🕳️ 해안 확인 공백: 제보가 없는 곳은 '깨끗한 곳'이 아니라 '모르는 곳'")
         z1, z2, z3, z4 = st.columns(4)
-        z1.metric("해안 구역 (마을어장 지선)", f"{cs['total']}곳")
+        z1.metric(f"해안 구역 (마을어장 {cs['fishery']} + 항만 {cs['port']})", f"{cs['total']}곳")
         z2.metric(f"최근 {core.RECENT_CHECK_DAYS}일 안에 확인",
                   f"{cs['최근 확인']}곳 ({cs['최근 확인'] / cs['total'] * 100:.0f}%)")
         z3.metric("오래전 확인", f"{cs['오래전 확인']}곳")
@@ -242,9 +242,10 @@ with tab_map:
                "흰색 수거 완료 · 회색 확인 기록 없음　| 크기: 근거 수　"
                "| 테두리: 파랑 공공 조사 · 청록 기관·언론 기록 · 주황 시민 제보 포함")
     if show_zones:
-        st.caption("▭ 해안 구역(마을어장 지선): **빨간 점선 = 확인 기록 없음** · 보라 = 오래전 확인"
+        st.caption("▭ 해안 구역(마을어장 지선 + 항만 6곳): **빨간 점선 = 확인 기록 없음** · 보라 = 오래전 확인"
                    f"({core.RECENT_CHECK_DAYS}일 넘음) · 초록 = 최근 확인. 확인 = 조사·기록·제보·수거 완료·순찰(이상 없음) 중 하나라도 있었던 날. "
-                   "출처: 해양수산부 국립해양조사원 어장정보도(마을어업), 추자도 제외")
+                   "출처: 해양수산부 국립해양조사원 어장정보도(마을어업), 추자도 제외. "
+                   "항만(제주·서귀포 무역항, 한림·애월·화순·성산포 연안항)은 어장이 없어 항 중심 반경 800m 원으로 추가")
 
     st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
     live = core.priority(table, n=len(table))
@@ -410,30 +411,46 @@ with tab_list:
 
         st.markdown("##### 🧭 순찰 확인 기록 (쓰레기 이상 없음)")
         st.caption("순찰했는데 쓰레기가 거의 없었다면 여기서 기록하세요. 이 구역은 '최근 확인'으로 바뀌어 공백 목록에서 빠지고, "
-                   f"{core.RECENT_CHECK_DAYS}일이 지나면 다시 공백 목록에 올라옵니다. "
+                   f"{core.RECENT_CHECK_DAYS}일이 지나면 다시 공백 목록에 올라옵니다. 구역 안에 **재확인 필요 지점이 있으면 "
+                   "함께 수거 완료로 처리**되어 예전 근거가 점수에서 빠집니다. "
                    "**쓰레기가 있었다면 '📸 쓰레기 제보' 탭에서 제보**해야 위험 순위에 반영됩니다.")
-        todo = list(cov[cov.state != "최근 확인"].zone)
-        if todo:
-            pz1, pz2, pz3 = st.columns([2, 2, 1])
-            pz = pz1.selectbox("순찰한 구역", todo, key="patrol_zone",
-                               format_func=lambda z: f"{z} ({cov.set_index('zone').at[z, 'emd']})")
-            pwho = pz2.text_input("순찰자 / 메모 (선택)", key="patrol_who", placeholder="예: 대정읍 지킴이, 해변 2km 도보")
-            pz3.write("")
-            if pz3.button("이상 없음 기록", use_container_width=True):
-                st.session_state.patrols.append({"zone": pz, "date": TODAY.isoformat(), "by": pwho,
-                                                 "logged": datetime.now().strftime("%Y-%m-%d %H:%M")})
-                save_patrols()
-                st.session_state.flash_patrol = f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
-                st.rerun()
+        zone_opts = list(cov.zone)          # 공백 구역이 먼저, 최근 확인 구역은 뒤에
+        emd_of = dict(zip(cov.zone, cov.emd))
+        pz1, pz2, pz3 = st.columns([2, 2, 1])
+        pz = pz1.selectbox("순찰한 구역", zone_opts, key="patrol_zone", format_func=lambda z: f"{z} ({emd_of[z]})")
+        pwho = pz2.text_input("순찰자 / 메모 (선택)", key="patrol_who", placeholder="예: 대정읍 지킴이, 해변 2km 도보")
+        pz3.write("")
+        clear = core.stale_points_in_zone(table, zones, pz)
+        if clear:
+            st.caption("이 구역의 재확인 필요 지점 → 함께 수거 완료 처리: **" + ", ".join(clear) + "**")
+        if pz3.button("이상 없음 기록", use_container_width=True):
+            now = datetime.now()
+            pid = now.strftime("%Y%m%d%H%M%S%f")
+            logged = now.strftime("%Y-%m-%d %H:%M")
+            st.session_state.patrols.append({"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
+                                             "id": pid, "cleared": clear})
+            for site in clear:
+                st.session_state.cleanups.append({"site": site, "date": TODAY.isoformat(), "logged": logged,
+                                                  "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""),
+                                                  "patrol": pid})
+            save_patrols()
+            save_cleanups()
+            st.session_state.flash_patrol = (f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
+                                             + (f" 수거 완료 처리: {', '.join(clear)}" if clear else ""))
+            st.rerun()
         if st.session_state.get("flash_patrol"):
             st.success(st.session_state.pop("flash_patrol"))
         if st.session_state.patrols:
-            plog = pd.DataFrame(st.session_state.patrols)[["date", "zone", "by", "logged"]]
-            plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "기록 시각"]
+            plog = pd.DataFrame(st.session_state.patrols).reindex(columns=["date", "zone", "by", "cleared", "logged"])
+            plog["cleared"] = plog["cleared"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+            plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "함께 수거 완료 처리", "기록 시각"]
             st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
             if st.button("↩️ 마지막 순찰 기록 되돌리기"):
-                st.session_state.patrols.pop()
+                last = st.session_state.patrols.pop()
+                if last.get("id"):          # 이 순찰로 만든 수거 완료 기록도 함께 취소
+                    st.session_state.cleanups = [c for c in st.session_state.cleanups if c.get("patrol") != last["id"]]
                 save_patrols()
+                save_cleanups()
                 st.rerun()
 
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
@@ -441,10 +458,15 @@ with tab_list:
         st.divider()
         st.markdown("#### 🔎 재확인 권장 지점 (예전에 쓰레기가 확인된 곳)")
         sv = stale[["name", "emd", "status", "potential", "last_date", "last_cleanup"]].copy()
-        sv.columns = ["지점", "읍면동", "상태", "원래 위험도", "마지막 근거", "마지막 수거"]
+        if zones:
+            zname = [z["properties"]["name"] for z in zones]
+            sv.insert(2, "해안 구역", [zname[i] if (i := core.nearest_zone(zones, r.lat, r.lon)) is not None else "-"
+                                    for r in stale.itertuples()])
+        sv.columns = ["지점", "읍면동"] + (["해안 구역"] if zones else []) + ["상태", "원래 위험도", "마지막 근거", "마지막 수거"]
         st.dataframe(sv, hide_index=True, use_container_width=True)
         st.caption("예전에 쓰레기가 확인됐지만 최근 근거가 없는 곳입니다. 깨끗해졌는지, 아무도 안 가 봤는지 모르니 순찰로 확인하세요. "
-                   "**원래 위험도**(시간 감쇠를 빼고 본 점수)가 높은 곳부터 가면 됩니다.")
+                   "**원래 위험도**(시간 감쇠를 빼고 본 점수)가 높은 곳부터 가면 됩니다. "
+                   "가 봤더니 깨끗했다면 위 **🧭 순찰 확인 기록**에서 그 해안 구역을 '이상 없음'으로 기록하세요 → 수거 완료로 처리됩니다.")
 
     if st.session_state.reports:
         st.markdown("#### 제보 기록")
