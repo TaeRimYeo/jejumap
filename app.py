@@ -109,7 +109,7 @@ with tab_map:
     p2 = tr[tr.연도.between(2019, 2023)]["제주 합계"].mean()
     peak = tr.loc[tr["제주 합계"].idxmax()]
     k1, k2, k3 = st.columns(3)
-    k1.metric("연평균 수거량 (2019~2023)", f"{p2:,.0f}톤", f"{(p2 / p1 - 1) * 100:+.0f}% vs 2014~2018")
+    k1.metric("연평균 수거량 (2019–2023)", f"{p2:,.0f}톤", f"{(p2 / p1 - 1) * 100:+.0f}% vs 2014–2018")
     k2.metric("최대 수거 연도", f"{int(peak.연도)}년", f"{peak['제주 합계']:,.0f}톤")
     k3.metric("전국 대비 제주 비중 (최대)", f"{tr['제주 비중(%)'].max():.1f}%")
     st.bar_chart(tr[tr.연도 >= 2009].set_index("연도")[["제주시", "서귀포시", "제주 기타"]],
@@ -121,7 +121,7 @@ with tab_map:
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("지도 지점", len(table))
     c2.metric("공공 조사 (2021)", int(table.public_evidence.sum()))
-    c3.metric("기관·언론 기록 (2025~26)", len(records))
+    c3.metric("기관·언론 기록 (2025–26)", len(records))
     c4.metric("시민 제보", len(st.session_state.reports))
     c5.metric("미측정 지점", int(table.risk_index.isna().sum()))
 
@@ -143,7 +143,7 @@ with tab_map:
                             fill=True, fill_color=color_for(score), fill_opacity=0.85,
                             tooltip=tip, popup=folium.Popup(pop, max_width=280)).add_to(m)
     st_folium(m, height=520, use_container_width=True, returned_objects=[])
-    st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3~4.5) · 초록 낮음 · 회색 미측정　"
+    st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · 회색 미측정　"
                "| 크기: 근거 수　| 테두리: 파랑 공공 조사 · 초록 기관·언론 기록 · 주황 시민 제보 포함")
 
     st.markdown("#### 📊 현재 위험 순위 (공공 조사 + 기관 기록 + 시민 제보)")
@@ -155,7 +155,7 @@ with tab_map:
     st.caption(f"제보가 들어올 때마다 바뀝니다. 아직 근거가 없는 지점 {int(table.risk_index.isna().sum())}곳은 순위에서 빠져 있어요.")
 
     if len(records_df):
-        st.markdown("#### 🗂️ 기관·언론 정화 기록 (2025~2026)")
+        st.markdown("#### 🗂️ 기관·언론 정화 기록 (2025–2026)")
         rv = records_df[["date", "place", "category", "amount_kg", "debris", "org", "source", "url", "note"]].copy()
         rv["category"] = rv["category"].map(core.LABEL)
         rv["amount_kg"] = rv["amount_kg"].map(lambda v: "" if pd.isna(v) else f"{v:,.0f}")
@@ -298,7 +298,7 @@ with tab_check:
     m2.metric("기본 순위와 평균 순위상관", f"{summ['rho_mean']:.2f}")
     m3.metric("가장 다른 조합의 순위상관", f"{summ['rho_min']:.2f}")
     st.dataframe(rb, hide_index=True, use_container_width=True)
-    st.caption("폐어구 2~5, 플라스틱·스티로폼 1.5~2.5, 돌고래 배율 0~1.5, 마을어장 1~2, 근거 수 보정 0~2를 조합해 "
+    st.caption("폐어구 2–5, 플라스틱·스티로폼 1.5–2.5, 돌고래 배율 0–1.5, 마을어장 1–2, 근거 수 보정 0–2를 조합해 "
                "다시 계산했습니다 (폐어구가 가장 위험하다는 전제는 유지). 순위상관은 1에 가까울수록 순위가 그대로라는 뜻입니다.")
     st.info("**읽는 법:** 상위 3 유지율이 100%인 지점은 가중치를 어떻게 바꿔도 우선 수거 대상입니다. "
             "김녕리처럼 유지율이 낮은 지점은 돌고래 근거가 순위를 끌어올리는 곳이라, 돌고래 배율을 0으로 두면 내려갑니다. "
