@@ -71,6 +71,14 @@ class LocalStore:
         self._write(kind, rows)
         return rec
 
+    def add_many(self, kind, recs):
+        recs = [dict(r, _id=r.get("_id") or new_id()) for r in recs]
+        rows = self._read(kind)
+        have = {r["_id"] for r in rows}
+        rows += [r for r in recs if r["_id"] not in have]
+        self._write(kind, rows)
+        return recs
+
     def remove(self, kind, ids):
         ids = set(ids)
         if ids:
@@ -122,6 +130,15 @@ class SupabaseStore:
         data = {k: v for k, v in rec.items() if k != "_id"}
         self._req("POST", "", {"id": rec["_id"], "kind": kind, "data": data}, prefer="return=minimal")
         return rec
+
+    def add_many(self, kind, recs):
+        """여러 건을 한 번에 저장. 같은 id가 이미 있으면 건너뜀(다시 가져오기 안전)."""
+        recs = [dict(r, _id=r.get("_id") or new_id()) for r in recs]
+        for i in range(0, len(recs), 500):
+            body = [{"id": r["_id"], "kind": kind, "data": {k: v for k, v in r.items() if k != "_id"}}
+                    for r in recs[i:i + 500]]
+            self._req("POST", "?on_conflict=id", body, prefer="resolution=ignore-duplicates,return=minimal")
+        return recs
 
     def remove(self, kind, ids):
         ids = [i for i in ids if i]

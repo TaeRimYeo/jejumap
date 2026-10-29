@@ -2,6 +2,7 @@
 실행:  streamlit run app.py
 """
 import hashlib
+import io
 import hmac
 import json
 import os
@@ -375,6 +376,8 @@ with tab_map:
 # ---------------- 2. 제보 ----------------
 with tab_report:
     st.markdown("#### 해변 쓰레기를 찍어 올려주세요")
+    st.caption(f"불법 투기 단속이나 대형 폐기물처럼 행정 처분이 필요한 건은 [안전신문고]({core.SAFETY_REPORT_URL})로도 신고해 주세요. "
+               "이 앱은 기존 신고를 대신하지 않고, 신고·수거 기록을 모아 **어디부터 치울지** 정하는 도구예요.")
     st.caption("🔒 이름·연락처는 받지 않아요. 사진은 저장하지 않고, 위치는 쓰레기가 있는 곳(지도에서 고른 지점)만 기록합니다. "
                "내 휴대폰의 GPS 위치는 수집하지 않아요.")
     if st.session_state.get("flash"):
@@ -489,8 +492,20 @@ with tab_list:
     keeper = (not admin_code) or bool(st.session_state.get("keeper"))
     if not keeper:
         st.caption("수거 완료·순찰 기록은 지킴이 코드가 있어야 할 수 있어요. 목록 보기와 CSV 다운로드는 누구나 가능합니다.")
-    st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)")
-    rep = core.priority(table, 5)
+    emd_opts = ["전체"] + core.EMD_LIST
+    q_emd = st.query_params.get("emd", "")
+    view = st.selectbox("📍 담당 읍면동만 보기 (주소 뒤 ?emd= 로 바로 열 수 있어요)", emd_opts,
+                        index=emd_opts.index(q_emd) if q_emd in emd_opts else 0, key="view_emd")
+    if view != "전체":
+        st.query_params["emd"] = view
+    elif "emd" in st.query_params:
+        del st.query_params["emd"]
+    vemd = None if view == "전체" else view
+    table_v = table if vemd is None else table[table.emd == vemd]
+    cov_v = cov if (cov is None or vemd is None) else cov[cov.emd == core.zone_emd(vemd)]
+
+    st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)" + (f" · {vemd}" if vemd else ""))
+    rep = core.priority(table_v, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
         ["순위", "name", "emd", "risk_index", "status", "adj_hazard", "evidence", "record_count", "report_count",
          "village_fishery", "dolphin_basis"]]
@@ -502,7 +517,64 @@ with tab_list:
                "**'검토 대기'** 는 검토 전 시민 제보만 있는 곳이라, 출동 전에 아래 🛡️ 제보 검토에서 사진·현장을 확인하세요.")
     st.dataframe(rep, hide_index=True, use_container_width=True)
     st.download_button("📥 지킴이 전달용 CSV 다운로드", rep.to_csv(index=False).encode("utf-8-sig"),
-                       file_name=f"우선수거구역_{now_kst():%Y%m%d}.csv", mime="text/csv")
+                       file_name=f"우선수거구역_{vemd or '전체'}_{now_kst():%Y%m%d}.csv", mime="text/csv")
+
+    st.divider()
+    st.markdown("#### 🔗 기존 업무로 보내기 (새 앱을 또 쓰지 않아도 되게)")
+    st.caption("담당자는 이 앱을 매일 열 필요 없이, 아래 브리핑을 메신저·공문에 붙여 넣거나 파일을 기존 시스템에 올리면 됩니다.")
+    brief = core.briefing_text(table, cov, vemd, TODAY)
+    b1, b2 = st.columns([3, 2])
+    with b1:
+        st.code(brief, language=None)
+    with b2:
+        st.download_button("📝 브리핑 텍스트(.txt)", brief.encode("utf-8"),
+                           file_name=f"수거브리핑_{vemd or '전체'}_{now_kst():%Y%m%d}.txt", mime="text/plain",
+                           use_container_width=True)
+        st.download_button("🗺️ 위험 지도 GeoJSON (도청 GIS용)", core.export_geojson(table, TODAY).encode("utf-8"),
+                           file_name=f"해안위험지도_{now_kst():%Y%m%d}.geojson", mime="application/geo+json",
+                           use_container_width=True)
+        if REPORTS:
+            allrep = pd.DataFrame(REPORTS).reindex(columns=["time", "place", "emd", "lat", "lon", "category", "channel",
+                                                            "review"])
+            allrep["category"] = allrep["category"].map(lambda c: core.LABEL.get(c, c))
+            st.download_button("📋 제보 전체 CSV", allrep.fillna("").to_csv(index=False).encode("utf-8-sig"),
+                               file_name=f"제보전체_{now_kst():%Y%m%d}.csv", mime="text/csv", use_container_width=True)
+        st.caption(f"브리핑 오른쪽 위 복사 버튼으로 복사돼요. 링크를 열면 {vemd or '전체'} 화면이 바로 뜹니다.")
+
+    with st.expander("📥 기존 채널 기록 가져오기 (안전신문고 내려받기·지킴이 실적 등)"):
+        st.caption("이미 쓰고 있는 신고·수거 실적을 CSV로 올리면 지도에 합쳐집니다. 공식 채널 기록이라 '확인'으로 들어가고, "
+                   "같은 파일을 두 번 올려도 한 번만 반영돼요. 필수 열: 날짜·위도·경도·종류 (장소·출처·메모는 선택).")
+        st.download_button("양식 CSV 받기", core.IMPORT_TEMPLATE.encode("utf-8-sig"), file_name="가져오기_양식.csv",
+                           mime="text/csv")
+        up = st.file_uploader("CSV 올리기", type=["csv"], key="import_csv", disabled=not keeper)
+        if up is not None:
+            try:
+                raw = up.getvalue()
+                try:
+                    idf = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig")
+                except UnicodeDecodeError:
+                    idf = pd.read_csv(io.BytesIO(raw), encoding="cp949")      # 엑셀에서 저장한 한글 CSV
+                rows, skipped = core.parse_import(idf.head(2000), beaches, zones)
+            except Exception as e:
+                rows, skipped = [], [(0, f"파일을 읽지 못했어요: {str(e)[:80]}")]
+            have = {r.get("_id") for r in st.session_state.reports}
+            new_rows = [r for r in rows if r["_id"] not in have]
+            st.write(f"읽은 행 {len(rows) + len(skipped)} · 가져올 새 기록 **{len(new_rows)}건** · "
+                     f"이미 있음 {len(rows) - len(new_rows)} · 건너뜀 {len(skipped)}")
+            if skipped:
+                st.dataframe(pd.DataFrame(skipped, columns=["행", "이유"]).head(20), hide_index=True)
+            if new_rows and st.button(f"{len(new_rows)}건 가져오기", type="primary", disabled=not keeper):
+                try:
+                    store.add_many("reports", new_rows)
+                    st.session_state.reports += new_rows
+                    st.session_state.my_ids += [r["_id"] for r in new_rows]
+                    st.session_state.flash_import = f"📥 {len(new_rows)}건을 가져왔어요. 지도·순위·확인 공백에 반영됐습니다."
+                except store_mod.StoreError as e:
+                    print("[import]", e)
+                    st.session_state.flash_import = "가져오기 저장에 실패했어요. 잠시 후 다시 해주세요."
+                st.rerun()
+        if st.session_state.get("flash_import"):
+            st.success(st.session_state.pop("flash_import"))
 
     st.divider()
     st.markdown("#### ✅ 수거 완료 처리")
@@ -536,12 +608,12 @@ with tab_list:
         st.markdown("#### 🕳️ 확인 공백 구역 (한 번도 확인되지 않은 해안부터)")
         st.caption("제보·기록이 없는 구역은 깨끗한 게 아니라 **모르는 곳**입니다. 위험 순위에는 안 나오므로 따로 순찰 목록을 만듭니다. "
                    "순서: 확인 기록 없음 → 오래전 확인, 같은 상태 안에서는 민감도(돌고래·마을어장·겨울 북서풍) 높은 곳 먼저.")
-        gap = cov[cov.state != "최근 확인"].head(15)
+        gap = cov_v[cov_v.state != "최근 확인"].head(15)
         gv = gap[["zone", "emd", "state", "sensitivity", "last_check", "points"]].copy()
         gv.insert(0, "순서", range(1, len(gv) + 1))
         gv.columns = ["순서", "해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "근처 지점"]
         st.dataframe(gv, hide_index=True, use_container_width=True)
-        full = cov[cov.state != "최근 확인"][["zone", "emd", "state", "sensitivity", "last_check", "lat", "lon"]]
+        full = cov_v[cov_v.state != "최근 확인"][["zone", "emd", "state", "sensitivity", "last_check", "lat", "lon"]]
         full.columns = ["해안 구역", "읍면동", "상태", "민감도", "마지막 확인", "위도", "경도"]
         st.download_button(f"📥 확인 공백 구역 전체 {len(full)}곳 CSV", full.to_csv(index=False).encode("utf-8-sig"),
                            file_name=f"확인공백구역_{now_kst():%Y%m%d}.csv", mime="text/csv")

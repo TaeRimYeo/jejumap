@@ -6,6 +6,7 @@ import time
 import json
 import math
 import re
+import urllib.parse
 
 import pandas as pd
 
@@ -199,7 +200,7 @@ def build_structure(beaches, reports, records=None):
             evid[idx].append(e)
         else:
             fishery = it["near_fishery"] if it["near_fishery"] is not None else True  # 제주 해안 대부분 마을어장
-            base = f"{it['place']} · {it['rid'][:4]}" if it.get("rid") else it["place"]  # 제보 id로 고정된 이름
+            base = f"{it['place']} · {str(it['rid'])[-4:]}" if it.get("rid") else it["place"]  # 제보 id로 고정된 이름
             name, k = base, 2
             while (t.name == name).any():          # 같은 이름의 다른 지점이 있으면 번호를 붙여 구분
                 name = f"{base} #{k}"
@@ -220,7 +221,7 @@ def apply_reviews(reports, reviews):
     last = {}
     for rv in sorted(reviews or [], key=lambda r: str(r.get("logged", ""))):
         last[rv.get("report")] = rv.get("verdict")
-    return [dict(r, review=last.get(r.get("_id"))) for r in reports or []]
+    return [dict(r, review=last.get(r.get("_id"), r.get("review"))) for r in reports or []]   # 가져온 공식 기록은 기본 확인
 
 
 def find_duplicate(reports, new, meters=300, hours=DUP_HOURS):
@@ -690,6 +691,131 @@ def sanitize_image(image_bytes, max_side=1024):
         return out.getvalue(), "image/jpeg"
     except Exception:
         return None
+
+
+# ---------- 기존 채널과 연결 ("또 하나의 앱"이 되지 않게) ----------
+APP_URL = "https://jeju-coast-map.streamlit.app/"
+SAFETY_REPORT_URL = "https://www.safetyreport.go.kr/"
+DONG_ZONE = {"삼양동": "제주시 동지역", "화북동": "제주시 동지역", "건입동": "제주시 동지역", "이호동": "제주시 동지역",
+             "중문동": "서귀포시 동지역"}
+CATEGORY_ALIASES = {"폐어구": "fishing_gear", "어구": "fishing_gear", "그물": "fishing_gear", "로프": "fishing_gear",
+                    "밧줄": "fishing_gear", "낚싯줄": "fishing_gear", "통발": "fishing_gear", "부표": "styrofoam",
+                    "스티로폼": "styrofoam", "플라스틱": "plastic", "페트병": "plastic", "비닐": "plastic",
+                    "해조류": "seaweed", "괭생이모자반": "seaweed", "모자반": "seaweed", "기타": "other",
+                    "생활쓰레기": "plastic", "유리": "other", "금속": "other", "캔": "other"}
+IMPORT_COLUMNS = {"date": ["date", "날짜", "일자", "신고일", "수거일"], "place": ["place", "장소", "위치", "지점"],
+                  "lat": ["lat", "위도"], "lon": ["lon", "lng", "경도"], "category": ["category", "종류", "쓰레기 종류", "유형"],
+                  "channel": ["channel", "출처", "채널"], "note": ["note", "메모", "비고"]}
+IMPORT_TEMPLATE = ("날짜,장소,위도,경도,종류,출처,메모\n"
+                   "2026-10-28,대정읍 하모리 해안,33.2045,126.2560,폐어구,안전신문고,그물 엉킴\n"
+                   "2026-10-28,김녕 해변,33.5573,126.7590,플라스틱,바다환경지킴이 실적,\n")
+
+
+def zone_emd(emd):
+    """지점 읍면동 이름 -> 해안 구역 읍면동 이름 (동 지역은 시 단위로 묶여 있음)."""
+    return DONG_ZONE.get(emd, emd)
+
+
+def _norm_category(v):
+    v = str(v or "").strip()
+    if v in HAZARD:
+        return v
+    for k, key in CATEGORY_ALIASES.items():
+        if k in v:
+            return key
+    return None
+
+
+def parse_import(df, beaches, zones=None, default_channel="기존 채널"):
+    """안전신문고 내려받기·지킴이 실적 등 기존 채널 CSV -> 제보 기록 목록.
+    공식 채널 기록이라 '확인'으로 들어가고, 같은 행은 같은 id라 두 번 가져와도 한 번만 저장된다.
+    반환: (기록 목록, 건너뛴 행 [(행 번호, 이유)])"""
+    cols = {}
+    for key, names in IMPORT_COLUMNS.items():
+        for c in df.columns:
+            if str(c).strip().lower() in [n.lower() for n in names]:
+                cols[key] = c
+                break
+    missing = [k for k in ("date", "lat", "lon", "category") if k not in cols]
+    if missing:
+        return [], [(0, "필수 열이 없어요: " + ", ".join(missing) + " (날짜·위도·경도·종류)")]
+    out, skipped = [], []
+    for i, row in df.iterrows():
+        n = i + 2                                        # 엑셀 기준 행 번호(머리글 1행)
+        cat = _norm_category(row[cols["category"]])
+        try:
+            lat, lon = float(row[cols["lat"]]), float(row[cols["lon"]])
+        except (TypeError, ValueError):
+            skipped.append((n, "위도·경도가 숫자가 아니에요"))
+            continue
+        d = _to_date(str(row[cols["date"]])[:10]) if pd.notna(row[cols["date"]]) else None
+        if d is None:
+            skipped.append((n, "날짜를 읽을 수 없어요"))
+            continue
+        if cat is None:
+            skipped.append((n, f"종류를 알 수 없어요: {row[cols['category']]}"))
+            continue
+        if not in_jeju(lat, lon):
+            skipped.append((n, "제주 범위 밖 좌표"))
+            continue
+        channel = str(row[cols["channel"]]).strip() if "channel" in cols and pd.notna(row[cols["channel"]]) else default_channel
+        near, dist = nearest_point(beaches, lat, lon)
+        emd = near.emd if dist < 3000 else "기타"
+        if zones:
+            zi = nearest_zone(zones, lat, lon)
+            if zi is not None and zones[zi]["properties"]["emd"] in EMD_LIST:
+                emd = zones[zi]["properties"]["emd"]
+        place = str(row[cols["place"]]).strip() if "place" in cols and pd.notna(row[cols["place"]]) else f"{channel} 기록 ({emd})"
+        attach = near["name"] if dist <= ATTACH_M else None
+        rid = hashlib.sha1(f"{channel}|{d}|{lat:.5f}|{lon:.5f}|{cat}|{place}".encode()).hexdigest()[:24]
+        note = scrub_memo(row[cols["note"]]) if "note" in cols and pd.notna(row[cols["note"]]) else ""
+        out.append({"_id": "imp_" + rid, "time": f"{d.isoformat()} 12:00:00", "place": place if attach is None else near["name"],
+                    "lat": round(lat, 5), "lon": round(lon, 5), "emd": emd, "category": cat,
+                    "near_fishery": bool(near.village_fishery) if attach else True, "coast_side": coast_side(lat, lon),
+                    "attach_to_name": attach, "ai": False, "sid": "import:" + channel, "channel": channel,
+                    "review": "ok", "note": note})
+    return out, skipped
+
+
+def export_geojson(table, today=None):
+    """지점별 위험 지수·상태를 GeoJSON으로 (도청 GIS·공공데이터 개방용)."""
+    feats = []
+    for r in table.itertuples():
+        feats.append({"type": "Feature", "geometry": {"type": "Point", "coordinates": [round(r.lon, 5), round(r.lat, 5)]},
+                      "properties": {"name": r.name, "emd": r.emd, "status": r.status,
+                                     "risk_index": None if pd.isna(r.risk_index) else float(r.risk_index),
+                                     "evidence": int(r.evidence), "reports": int(r.report_count),
+                                     "last_date": r.last_date, "last_cleanup": r.last_cleanup,
+                                     "village_fishery": bool(r.village_fishery)}})
+    return json.dumps({"type": "FeatureCollection", "name": "jeju_coast_risk",
+                       "generated": str(_to_date(today) or _dt.date.today()), "features": feats}, ensure_ascii=False)
+
+
+def briefing_text(table, cov, emd=None, today=None, n=3):
+    """읍면동 담당자에게 메신저·공문으로 바로 붙여넣을 주간 브리핑."""
+    today = _to_date(today) or _dt.date.today()
+    t = table if not emd else table[table.emd == emd]
+    c = cov if (cov is None or not emd) else cov[cov.emd == zone_emd(emd)]
+    title = emd or "제주 전체"
+    lines = [f"[제주 해안 지킴이 지도] {title} 수거 브리핑 ({today:%Y-%m-%d} 기준)", "", "1) 우선 수거"]
+    top = priority(t, n)
+    if len(top):
+        for k, r in enumerate(top.itertuples(), 1):
+            lines.append(f"  {k}. {r.name} – 위험 지수 {r.risk_index:.2f}, {r.status}"
+                         + (f", 마지막 근거 {r.last_date}" if r.last_date else ""))
+    else:
+        lines.append("  근거가 있는 지점이 없습니다(아래 확인 공백 구역 순찰 필요).")
+    if c is not None and len(c):
+        gap = c[c.state != "최근 확인"]
+        lines += ["", f"2) 확인 공백: 해안 구역 {len(c)}곳 중 {len(gap)}곳이 최근 {RECENT_CHECK_DAYS}일 확인 없음"]
+        for r in gap.head(n).itertuples():
+            lines.append(f"  - {r.zone} ({r.state})")
+    pend = int(t.unverified.sum()) if "unverified" in t else 0
+    if pend:
+        lines += ["", f"3) 검토 대기 제보 {pend}묶음 – 출동 전 사진·현장 확인 필요"]
+    link = APP_URL + (f"?emd={urllib.parse.quote(emd)}" if emd else "")
+    lines += ["", f"지도·상세: {link}"]
+    return "\n".join(lines)
 
 
 def classify_guarded(image_bytes, mime, api_key, guard, model=None, now=None, call=None):
