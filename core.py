@@ -50,6 +50,20 @@ def _to_date(v):
     return _dt.date.fromisoformat(str(v)[:10])
 
 
+def _to_dt(v, end_of_day=False):
+    """날짜/시각 문자열 -> datetime (시각이 없으면 하루의 시작, end_of_day면 끝)."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, _dt.datetime):
+        return v
+    if isinstance(v, _dt.date):
+        return _dt.datetime.combine(v, _dt.time.max if end_of_day else _dt.time.min)
+    s = str(v).strip()
+    if len(s) <= 10:
+        return _dt.datetime.combine(_dt.date.fromisoformat(s[:10]), _dt.time.max if end_of_day else _dt.time.min)
+    return _dt.datetime.fromisoformat(s[:16].replace(" ", "T"))
+
+
 def decay(source, ev_date, today, w=None):
     """근거 경과일에 따른 가중치 (반감기마다 절반)."""
     w = w or default_weights()
@@ -140,10 +154,12 @@ def _evidence_items(beaches, reports, records):
     items = []
     for rec in records or []:
         items.append(dict(source="record", category=rec["category"], date=_to_date(rec.get("date")),
+                          at=_to_dt(rec.get("date")),
                           place=rec["place"], emd=rec["emd"], lat=rec.get("lat"), lon=rec.get("lon"),
                           attach_name=rec.get("attach_to_name"), near_fishery=_as_bool(rec.get("near_fishery"))))
     for rep in reports or []:
         items.append(dict(source="report", category=rep["category"], date=_to_date(rep.get("time")),
+                          at=_to_dt(rep.get("time")),
                           place=rep["place"], emd=rep["emd"], lat=rep["lat"], lon=rep["lon"],
                           attach_idx=rep.get("attach_to"), near_fishery=rep.get("near_fishery")))
     return items
@@ -153,7 +169,8 @@ def build_structure(beaches, reports, records=None):
     """어떤 근거가 어느 지점에 붙는지 (가중치·날짜와 무관하므로 한 번만 계산).
     각 지점의 근거 목록(출처, 종류, 날짜)을 evid 열에 담는다."""
     t = beaches.copy().reset_index(drop=True)
-    evid = [[{"source": "public", "category": None, "date": _to_date(PUBLIC_DATE)}] if pd.notna(h) else []
+    evid = [[{"source": "public", "category": None, "date": _to_date(PUBLIC_DATE), "at": _to_dt(PUBLIC_DATE)}]
+            if pd.notna(h) else []
             for h in t["hazard_index"]]
     for it in _evidence_items(beaches, reports, records):
         idx = None
@@ -165,12 +182,16 @@ def build_structure(beaches, reports, records=None):
             near, dist = nearest_point(t, it["lat"], it["lon"])
             if dist <= ATTACH_M:
                 idx = near.name
-        e = {"source": it["source"], "category": it["category"], "date": it["date"]}
+        e = {"source": it["source"], "category": it["category"], "date": it["date"], "at": it["at"]}
         if idx is not None:
             evid[idx].append(e)
         else:
             fishery = it["near_fishery"] if it["near_fishery"] is not None else True  # 제주 해안 대부분 마을어장
-            row = dict(name=it["place"], type="기관 기록" if it["source"] == "record" else "시민제보",
+            name, k = it["place"], 2
+            while (t.name == name).any():          # 같은 이름의 다른 지점이 있으면 번호를 붙여 구분
+                name = f"{it['place']} #{k}"
+                k += 1
+            row = dict(name=name, type="기관 기록" if it["source"] == "record" else "시민제보",
                        emd=it["emd"], lat=it["lat"], lon=it["lon"], coast_side=coast_side(it["lat"], it["lon"]),
                        has_debris_data=False, village_fishery=fishery,
                        dolphin_weight=DOLPHIN.get(it["emd"], (0.0, ""))[0],
@@ -182,10 +203,10 @@ def build_structure(beaches, reports, records=None):
 
 
 def last_cleanups(cleanups):
-    """지점별 가장 최근 수거 완료 날짜."""
+    """지점별 가장 최근 수거 완료 시각 (기록 시각이 없으면 그날의 끝으로 봄)."""
     out = {}
     for c in cleanups or []:
-        d = _to_date(c["date"])
+        d = _to_dt(c.get("logged")) if c.get("logged") else _to_dt(c["date"], end_of_day=True)
         if c["site"] not in out or d > out[c["site"]]:
             out[c["site"]] = d
     return out
@@ -204,24 +225,36 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
     t = struct.copy()
     rows = t.to_dict("records")
     cols = {k: [] for k in ("public_evidence", "record_count", "report_count", "evidence", "avg_hazard",
-                            "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history")}
+                            "adj_hazard", "freshness", "last_date", "last_cleanup", "status", "history", "potential")}
     risks = []
     for r in rows:
         cut = done.get(r["name"])
         all_ev = r["evid"]
-        act = [e for e in all_ev if cut is None or (e["date"] is not None and e["date"] > cut)]
+        act = [e for e in all_ev if cut is None or (e["at"] is not None and e["at"] > cut)]
+        sens = sensitivity(r["emd"], r["village_fishery"], r["coast_side"], winter_on, w)
+        if all_ev:   # 순찰 우선순위용: 최신성·수거 여부를 빼고 본 원래 위험도
+            hs_all = [public_hazard(r, w) if e["source"] == "public" else hz[e["category"]] for e in all_ev]
+            n_all = len(all_ev)
+            cols["potential"].append(round((sum(hs_all) + w["prior_k"] * w["prior_m"]) / (n_all + w["prior_k"]) * sens, 2))
+        else:
+            cols["potential"].append(float("nan"))
         cnt = {s: sum(e["source"] == s for e in act) for s in ("public", "record", "report")}
         cols["public_evidence"].append(cnt["public"])
         cols["record_count"].append(cnt["record"])
         cols["report_count"].append(cnt["report"])
         cols["evidence"].append(len(act))
         cols["history"].append(len(all_ev))
-        cols["last_cleanup"].append(cut.isoformat() if cut else "")
+        cols["last_cleanup"].append(cut.date().isoformat() if cut else "")
         if not act:
             for k in ("avg_hazard", "adj_hazard", "freshness"):
                 cols[k].append(float("nan"))
             cols["last_date"].append("")
-            cols["status"].append("수거 완료" if cut else "미측정")
+            if cut is None:
+                cols["status"].append("미측정")
+            elif (today - cut.date()).days > w["hl_event"]:
+                cols["status"].append("수거 후 미확인 · 재확인 필요")   # 치운 지 오래됐는데 아무도 다시 안 봄
+            else:
+                cols["status"].append("수거 완료")
             risks.append(float("nan"))
             continue
         hs, ds = [], []
@@ -238,7 +271,7 @@ def score_structure(struct, winter_on, w=None, today=None, cleanups=None):
         cols["freshness"].append(fresh)
         cols["last_date"].append(last.isoformat())
         cols["status"].append("최근 근거" if fresh >= 0.5 else "오래된 근거 · 재확인 필요")
-        risks.append(round(adj * sensitivity(r["emd"], r["village_fishery"], r["coast_side"], winter_on, w) * fresh, 2))
+        risks.append(round(adj * sens * fresh, 2))
     for k, v in cols.items():
         t[k] = v
     t["risk_index"] = risks
@@ -286,13 +319,14 @@ def scenario_grid():
         for pl in (1.5, 2, 2.5):
             for ds in (0.0, 0.5, 1.0, 1.5):
                 for fi in (1.0, 1.5, 2.0):
-                    for k in (0.0, 1.0, 2.0):
-                        if pl >= fg:
-                            continue          # '폐어구가 가장 위험'이라는 전제는 유지
-                        w = default_weights()
-                        w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl)
-                        w.update(dolphin_scale=ds, fishery=fi, prior_k=k)
-                        grid.append(w)
+                    for k in (0.0, 1.0):
+                        for hl in (90, 180, 365):
+                            if pl >= fg:
+                                continue          # '폐어구가 가장 위험'이라는 전제는 유지
+                            w = default_weights()
+                            w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl)
+                            w.update(dolphin_scale=ds, fishery=fi, prior_k=k, hl_event=hl)
+                            grid.append(w)
     return grid
 
 
