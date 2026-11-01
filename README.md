@@ -92,6 +92,10 @@ alter table public.events add constraint events_kind_check
 - `ADMIN_CODE`를 Secrets에 넣으면 수거 완료·순찰·되돌리기는 지킴이 코드가 있어야 가능 (없으면 시연 모드로 누구나 가능)
 - API 키는 Streamlit Secrets에만 보관(저장소에 없음), DB는 RLS + 서버 전용 secret 키
 
+## 운영 메모
+- Streamlit 무료 앱은 오래 접속이 없으면 잠듭니다. `.github/workflows/keepalive.yml`이 6시간마다 실제 브라우저로 앱을 열어 깨워 둡니다(`scripts/keepalive.py`). GitHub의 Actions 탭에서 수동 실행도 가능
+- Supabase 무료 프로젝트는 1주일 동안 사용이 없으면 일시 정지됩니다. 위 keep-alive가 앱을 열 때 DB도 읽으므로 함께 깨어 있게 됩니다
+
 ## 실행
 ```
 pip install -r requirements.txt
