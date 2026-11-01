@@ -206,6 +206,8 @@ with st.sidebar:
     if st.session_state.get("store_error"):
         st.error("DB 저장/불러오기 실패. 화면에는 보이지만 저장되지 않았을 수 있어요. 잠시 후 🔄 새로고침을 눌러주세요.")
         print("[store]", st.session_state.store_error)     # 자세한 내용은 서버 로그에만
+    if not _secret("ADMIN_CODE"):
+        st.caption("🔓 지킴이 코드 미설정: 시연 모드라 누구나 수거 완료·검토를 할 수 있어요.")
     if st.button("🔄 다른 사람 기록까지 새로고침", use_container_width=True):
         load_all(force=True)
         st.rerun()
@@ -221,11 +223,12 @@ with st.sidebar:
         st.caption("AI 키가 없어요. 제보 화면에서 종류를 직접 고르면 됩니다.")
     st.divider()
     st.markdown("**현재 위험 지수**  \n= 보정 위해성 × (1+돌고래) × 마을어장 × 계절 × **최신성**  \n"
-                "**보정 위해성** = (근거 위해성 합 + 2) ÷ (근거 수 + 1)  \n"
-                "**근거 수** = 공공 조사 + 기관·언론 기록 + 시민 제보")
+                "**보정 위해성** = (유효 근거 수 × 평균 위해성 + 2) ÷ (유효 근거 수 + 1)  \n"
+                "**유효 근거 수** = 공공 조사·기관 기록 1건씩 + 시민 제보(검토 전 0.5건, 확인 1건, 중복은 1건으로)")
     st.caption(f"최신성: 근거가 오래될수록 가볍게 반영 (반감기 공공 조사 {core.HALF_LIFE_PUBLIC // 365}년, "
                f"기록·제보 {core.HALF_LIFE_EVENT}일). **수거 완료** 처리하면 그 전 근거는 빠집니다.")
-    st.caption("근거가 1건뿐인 곳은 중간값(2)과 반반 섞어서, 제보 한 건으로 순위가 튀지 않게 합니다.")
+    st.caption("근거가 적은 곳은 중간값(2) 쪽으로 당겨서, 제보 한 건으로 순위가 튀지 않게 합니다 "
+               "(확인된 근거 1건이면 반반, 검토 전 제보 1건이면 1/3만 반영). 평균 위해성은 최신 근거일수록 크게 칩니다.")
     st.caption(f"허위·중복 제보 대책: 같은 곳·같은 종류 {core.DUP_HOURS}시간 내 제보는 1건으로 묶음 · "
                f"검토 전 제보는 {core.UNVERIFIED_W}건으로 계산, 다른 사람 같은 제보나 지킴이 확인이 있으면 1건 · "
                "허위 판정은 제외")
@@ -450,10 +453,7 @@ with tab_report:
             st.caption("해조류는 생물에게 직접 해는 적지만, 많거나 다른 쓰레기가 섞이면 양식장·어장을 망가뜨리고 "
                        "썩기 전에 치워야 해서 위해성을 플라스틱 수준으로 올려 계산해요.")
 
-        emd_default = None
-        if lat is not None:
-            near, dist = core.nearest_point(beaches, lat, lon)
-            emd_default = near.emd if dist < 3000 else None
+        emd_default = core.guess_emd(lat, lon, beaches, zones) if lat is not None else None
         emd = st.selectbox("읍면동", core.EMD_LIST,
                            index=core.EMD_LIST.index(emd_default) if emd_default in core.EMD_LIST else 0)
 
@@ -469,16 +469,16 @@ with tab_report:
                 amount=amount, mixed=mixed,
                 ai_category=ai["category"] if ai else None, ai_conf=ai.get("confidence") if ai else None)
             recent = [t for t in st.session_state.get("my_report_times", []) if time.time() - t < 600]
-            dup = core.find_duplicate(REPORTS, new_rep)
+            mine = core.find_duplicate(REPORTS, new_rep, sid=st.session_state.sid)   # 내가 낸 같은 제보
             problem = core.valid_report(new_rep) or (
                 "10분에 제보 10건까지 받아요. 잠시 후 다시 해주세요." if len(recent) >= 10 else None) or (
-                f"이미 같은 곳에 같은 종류를 제보했어요 ({dup['time'][:16]}). 중복 제보는 한 번만 반영돼요."
-                if dup and dup.get("sid") == st.session_state.sid else None)
+                f"이미 같은 곳에 같은 종류를 제보했어요 ({mine['time'][:16]}). 중복 제보는 한 번만 반영돼요."
+                if mine else None)
             if problem:
                 st.session_state.flash_err = problem
                 st.rerun()
             st.session_state.my_report_times = recent + [time.time()]
-            persist("reports", new_rep)
+            saved = persist("reports", new_rep)
             st.session_state.pop("ai", None)
             new = core.build_table(beaches, core.apply_reviews(st.session_state.reports, st.session_state.reviews),
                                    winter, records, today=TODAY, cleanups=st.session_state.cleanups)
@@ -486,10 +486,14 @@ with tab_report:
             place = after["name"]
             st.session_state.stamps.add(place)
             score_txt = "-" if pd.isna(after.risk_index) else f"{after.risk_index:.2f}"
+            grp = next((g for g in core.merge_reports(after.evid) if saved["_id"] in (g.get("ids") or [])), None)
+            merged = bool(grp and grp.get("n_reports", 1) > 1)
+            verified = bool(grp and grp.get("verified"))      # 실제 계산 결과로 안내 (안내와 점수가 어긋나지 않게)
             st.session_state.flash = (f"제보 완료! **{place}** 위험 지수 {score_txt} · "
                                       f"근거 {after.evidence}건  \n🏅 '{place}' 해안 스탬프를 받았어요."
-                                      + ("  \n👥 다른 분이 24시간 안에 같은 곳·같은 종류를 제보해서 **한 건으로 합치고 '확인됨'**으로 올렸어요."
-                                         if dup else "  \n⏳ 다른 사람의 같은 제보나 지킴이 확인이 있으면 점수에 온전히 반영돼요."))
+                                      + ("  \n👥 다른 분의 같은 제보와 **한 건으로 합치고 '확인됨'**으로 올렸어요." if verified else
+                                         "  \n🔗 같은 곳·같은 종류 제보와 한 건으로 묶였어요." if merged else
+                                         "  \n⏳ 다른 사람의 같은 제보나 지킴이 확인이 있으면 점수에 온전히 반영돼요."))
             st.rerun()                     # 지도·리포트에 바로 반영
 
     if st.session_state.stamps:
@@ -503,7 +507,7 @@ with tab_list:
         with st.expander("🔒 지킴이·담당자 로그인 (수거 완료·순찰 기록용)"):
             code = st.text_input("지킴이 코드", type="password", key="keeper_code")
             if st.button("확인", key="keeper_btn"):
-                if hmac.compare_digest(code.strip(), admin_code):
+                if hmac.compare_digest(code.strip().encode("utf-8"), admin_code.strip().encode("utf-8")):
                     st.session_state.keeper = True
                     st.rerun()
                 st.error("코드가 맞지 않아요.")
@@ -519,7 +523,12 @@ with tab_list:
     elif "emd" in st.query_params:
         del st.query_params["emd"]
     vemd = None if view == "전체" else view
-    table_v = table if vemd is None else table[table.emd == vemd]
+    if vemd is None:
+        table_v = table
+    elif vemd in ("제주시 동지역", "서귀포시 동지역"):          # 시 단위로 고르면 그 안의 동 지점도 함께
+        table_v = table[table.emd.map(core.zone_emd) == vemd]
+    else:
+        table_v = table[table.emd == vemd]
     cov_v = cov if (cov is None or vemd is None) else cov[cov.emd == core.zone_emd(vemd)]
 
     st.markdown("#### 우선 수거 구역 (바다환경지킴이·행정 전달용)" + (f" · {vemd}" if vemd else ""))
@@ -568,7 +577,8 @@ with tab_list:
             allrep["category"] = allrep["category"].map(lambda c: core.LABEL.get(c, c))
             st.download_button("📋 제보 전체 CSV", allrep.fillna("").to_csv(index=False).encode("utf-8-sig"),
                                file_name=f"제보전체_{now_kst():%Y%m%d}.csv", mime="text/csv", use_container_width=True)
-        st.caption(f"브리핑 오른쪽 위 복사 버튼으로 복사돼요. 링크를 열면 {vemd or '전체'} 화면이 바로 뜹니다.")
+        st.caption(f"브리핑 오른쪽 위 복사 버튼으로 복사돼요. 링크를 열고 '📋 우선 수거 리포트' 탭을 누르면 "
+                   f"{vemd or '전체'} 목록이 바로 보여요.")
 
     with st.expander("📥 기존 채널 기록 가져오기 (안전신문고 내려받기·지킴이 실적 등)"):
         st.caption("이미 쓰고 있는 신고·수거 실적을 CSV로 올리면 지도에 합쳐집니다. 공식 채널 기록이라 '확인'으로 들어가고, "
@@ -782,10 +792,12 @@ with tab_check:
             st.rerun()
     if st.session_state.get("rb_args") == rb_args:
         rb, summ = st.session_state.rb_result
+        if rb.empty:
+            st.info("점수가 있는 지점이 없어 비교할 순위가 없어요 (모두 수거 완료이거나 근거가 없음).")
         m1, m2, m3 = st.columns(3)
         m1.metric("시험한 조합", f"{summ['scenarios']}개")
-        m2.metric("기본 순위와 평균 순위상관", f"{summ['rho_mean']:.2f}")
-        m3.metric("가장 다른 조합의 순위상관", f"{summ['rho_min']:.2f}")
+        m2.metric("기본 순위와 평균 순위상관", "-" if pd.isna(summ["rho_mean"]) else f"{summ['rho_mean']:.2f}")
+        m3.metric("가장 다른 조합의 순위상관", "-" if pd.isna(summ["rho_min"]) else f"{summ['rho_min']:.2f}")
         st.dataframe(rb, hide_index=True, use_container_width=True)
         st.caption("폐어구 2–5, 플라스틱·스티로폼 1.5–2.5, 돌고래 배율 0–1.5, 마을어장 1–2, 근거 수 보정 0·1, "
                    "기록·제보 반감기 90·180·365일을 조합해 다시 계산했습니다 (폐어구가 가장 위험하다는 전제는 유지). "

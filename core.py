@@ -24,7 +24,7 @@ FISHERY_W = 1.5      # 마을어장 500m 이내
 WINTER_NW_W = 1.2    # 겨울 북서계절풍: 북·서쪽 해안 가중
 ATTACH_M = 1000      # 기존 지점에서 이 거리 안이면 같은 지점으로 묶음
 EMD_LIST = ["구좌읍", "조천읍", "삼양동", "화북동", "건입동", "이호동", "애월읍", "한림읍", "한경면", "대정읍",
-            "안덕면", "중문동", "서귀포시 동지역", "남원읍", "표선면", "성산읍", "기타"]
+            "안덕면", "중문동", "서귀포시 동지역", "남원읍", "표선면", "성산읍", "제주시 동지역", "우도면", "기타"]
 # 근거 수 보정: 근거가 적은 지점의 평균 위해성을 중간값(플라스틱 수준 2) 쪽으로 당긴다.
 # 보정 위해성 = (근거 위해성 합 + K×M) / (근거 수 + K). 근거 1건이면 중간값과 반반 섞임.
 PRIOR_M = 2.0
@@ -246,6 +246,8 @@ def build_structure(beaches, reports, records=None):
                      amount=it.get("amount"), mixed=it.get("mixed", False))
         if idx is not None:
             evid[idx].append(e)
+        elif pd.isna(it.get("lat")) or pd.isna(it.get("lon")):
+            continue                              # 좌표도 없고 붙일 지점도 없는 기록은 지도에 못 올림
         else:
             fishery = it["near_fishery"] if it["near_fishery"] is not None else True  # 제주 해안 대부분 마을어장
             base = f"{it['place']} · {str(it['rid'])[-4:]}" if it.get("rid") else it["place"]  # 제보 id로 고정된 이름
@@ -272,11 +274,14 @@ def apply_reviews(reports, reviews):
     return [dict(r, review=last.get(r.get("_id"), r.get("review"))) for r in reports or []]   # 가져온 공식 기록은 기본 확인
 
 
-def find_duplicate(reports, new, meters=300, hours=DUP_HOURS):
-    """새 제보와 같은 종류·가까운 곳(같은 해변 또는 300m 이내)·24시간 이내인 기존 제보 (없으면 None)."""
+def find_duplicate(reports, new, meters=300, hours=DUP_HOURS, sid=None):
+    """새 제보와 같은 종류·가까운 곳(같은 해변 또는 300m 이내)·24시간 이내인 기존 제보 (없으면 None).
+    sid를 주면 그 사람(익명 세션)이 낸 제보만 찾는다 → 같은 사람의 반복 제보 차단용."""
     t_new = _to_dt(new.get("time"))
     best = None
     for r in reports or []:
+        if sid is not None and r.get("sid") != sid:
+            continue
         if r.get("review") == "reject" or r.get("category") != new.get("category"):
             continue
         t = _to_dt(r.get("time"))
@@ -604,9 +609,12 @@ def robustness(beaches, reports, records, winter_on, top_k=3, today=None, cleanu
                      f"상위 {top_k} 유지율": f"{sum(x <= top_k for x in rs) / len(rs) * 100:.0f}%",
                      "최고 순위": min(rs), "최저 순위": max(rs),
                      "순위 중앙값": float(pd.Series(rs).median())})
-    out = pd.DataFrame(rows).sort_values("기본 순위")
     rho = pd.Series(rhos).dropna()
-    return out, {"scenarios": len(grid), "rho_mean": float(rho.mean()), "rho_min": float(rho.min())}
+    if not rows:                                  # 점수가 있는 지점이 없음 (예: 모두 수거 완료)
+        return pd.DataFrame(), {"scenarios": len(grid), "rho_mean": float("nan"), "rho_min": float("nan")}
+    out = pd.DataFrame(rows).sort_values("기본 순위")
+    return out, {"scenarios": len(grid), "rho_mean": float(rho.mean()) if len(rho) else float("nan"),
+                 "rho_min": float(rho.min()) if len(rho) else float("nan")}
 
 
 def factor_overlap(table):
@@ -729,6 +737,28 @@ class QuotaGuard:
     def cached(self, h):
         return self.d["cache"].get(h)
 
+    def reserve(self, now):
+        """상한 확인과 호출 기록을 잠금 안에서 한 번에 (동시에 눌러도 상한을 넘지 않게, 실패한 호출도 셈).
+        반환: 막힌 이유(문자열) 또는 None(예약됨)."""
+        with _QUOTA_LOCK:
+            self._load()
+            today = self._kst_day(now)
+            if sum(1 for t in self.d["calls"] if self._kst_day(t) == today) >= SAFE_PER_DAY:
+                return f"오늘 AI 호출 {SAFE_PER_DAY}회 상한에 도달했어요. 내일 다시 쓸 수 있어요."
+            if len(self._recent(now, 60)) >= SAFE_PER_MINUTE:
+                return f"1분에 {SAFE_PER_MINUTE}회까지만 호출해요. 잠시 후 다시 눌러주세요."
+            self.d["calls"] = self._recent(now, 2 * 86400) + [now]
+            self._save()
+        return None
+
+    def store_result(self, h, result):
+        with _QUOTA_LOCK:
+            self._load()
+            self.d["cache"][h] = result
+            if len(self.d["cache"]) > 500:
+                self.d["cache"] = dict(list(self.d["cache"].items())[-500:])
+            self._save()
+
     def record(self, now, h, result):
         with _QUOTA_LOCK:
             self._load()
@@ -749,7 +779,7 @@ _RRN = re.compile(r"\d{6}[-\s]?[1-4]\d{6}")
 
 def scrub_memo(text):
     """메모에 실수로 적은 전화번호·이메일·주민번호를 가리고 길이를 제한."""
-    t = (text or "").strip()[:MEMO_MAX]
+    t = str(text if text is not None else "").strip()[:MEMO_MAX]
     t = _RRN.sub("[주민번호 삭제]", t)
     t = _EMAIL.sub("[이메일 삭제]", t)
     t = _PHONE.sub("[전화번호 삭제]", t)
@@ -810,6 +840,21 @@ IMPORT_TEMPLATE = ("날짜,장소,위도,경도,종류,출처,메모\n"
                    "2026-10-28,김녕 해변,33.5573,126.7590,플라스틱,바다환경지킴이 실적,\n")
 
 
+def guess_emd(lat, lon, beaches, zones=None):
+    """위치 -> 읍면동. 해안 구역(마을어장 지선) 기준이 먼저, 동 지역이면 가까운 해변의 동 이름으로 좁힘."""
+    near, dist = nearest_point(beaches, lat, lon)
+    beach_emd = near.emd if dist < 3000 else None
+    if zones:
+        zi = nearest_zone(zones, lat, lon)
+        if zi is not None:
+            ze = zones[zi]["properties"]["emd"]
+            if beach_emd and zone_emd(beach_emd) == ze:
+                return beach_emd                  # 예: 제주시 동지역 → 삼양동
+            if ze in EMD_LIST:
+                return ze
+    return beach_emd if beach_emd in EMD_LIST else "기타"
+
+
 def zone_emd(emd):
     """지점 읍면동 이름 -> 해안 구역 읍면동 이름 (동 지역은 시 단위로 묶여 있음)."""
     return DONG_ZONE.get(emd, emd)
@@ -847,7 +892,9 @@ def parse_import(df, beaches, zones=None, default_channel="기존 채널"):
         except (TypeError, ValueError):
             skipped.append((n, "위도·경도가 숫자가 아니에요"))
             continue
-        d = _to_date(str(row[cols["date"]])[:10]) if pd.notna(row[cols["date"]]) else None
+        dv = pd.to_datetime(str(row[cols["date"]]).strip().replace(".", "-").replace("/", "-").rstrip("-"),
+                            errors="coerce") if pd.notna(row[cols["date"]]) else pd.NaT
+        d = None if pd.isna(dv) else dv.date()
         if d is None:
             skipped.append((n, "날짜를 읽을 수 없어요"))
             continue
@@ -859,15 +906,11 @@ def parse_import(df, beaches, zones=None, default_channel="기존 채널"):
             continue
         channel = str(row[cols["channel"]]).strip() if "channel" in cols and pd.notna(row[cols["channel"]]) else default_channel
         near, dist = nearest_point(beaches, lat, lon)
-        emd = near.emd if dist < 3000 else "기타"
-        if zones:
-            zi = nearest_zone(zones, lat, lon)
-            if zi is not None and zones[zi]["properties"]["emd"] in EMD_LIST:
-                emd = zones[zi]["properties"]["emd"]
+        emd = guess_emd(lat, lon, beaches, zones)
         place = str(row[cols["place"]]).strip() if "place" in cols and pd.notna(row[cols["place"]]) else f"{channel} 기록 ({emd})"
         attach = near["name"] if dist <= ATTACH_M else None
         rid = hashlib.sha1(f"{channel}|{d}|{lat:.5f}|{lon:.5f}|{cat}|{place}".encode()).hexdigest()[:24]
-        note = scrub_memo(row[cols["note"]]) if "note" in cols and pd.notna(row[cols["note"]]) else ""
+        note = scrub_memo(str(row[cols["note"]])) if "note" in cols and pd.notna(row[cols["note"]]) else ""
         out.append({"_id": "imp_" + rid, "time": f"{d.isoformat()} 12:00:00", "place": place if attach is None else near["name"],
                     "lat": round(lat, 5), "lon": round(lon, 5), "emd": emd, "category": cat,
                     "near_fishery": bool(near.village_fishery) if attach else True, "coast_side": coast_side(lat, lon),
@@ -917,7 +960,7 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
     if pend:
         lines += ["", f"3) 검토 대기 제보 {pend}묶음 – 출동 전 사진·현장 확인 필요"]
     link = APP_URL + (f"?emd={emd.replace(' ', '%20')}" if emd else "")   # 한글 그대로 (메신저에서 읽기 쉽게)
-    lines += ["", f"지도·상세: {link}"]
+    lines += ["", f"지도·상세: {link}" + (" ('📋 우선 수거 리포트' 탭에 이 지역만 표시)" if emd else "")]
     return "\n".join(lines)
 
 
@@ -928,7 +971,7 @@ def classify_guarded(image_bytes, mime, api_key, guard, model=None, now=None, ca
     hit = guard.cached(h)
     if hit:
         return hit, "같은 사진이라 저장된 결과를 썼어요 (호출 안 함)."
-    blocked = guard.check(now)
+    blocked = guard.reserve(now)          # 호출 전에 한도 자리를 잡음 (실패해도 1회로 셈)
     if blocked:
         return None, blocked
     try:
@@ -938,7 +981,7 @@ def classify_guarded(image_bytes, mime, api_key, guard, model=None, now=None, ca
         if "429" in msg:
             return None, "Google 무료 한도에 걸렸어요. 직접 골라서 진행해주세요."
         return None, f"AI 분류 실패: {msg[:120]}"
-    guard.record(now, h, res)
+    guard.store_result(h, res)
     return res, None
 
 
