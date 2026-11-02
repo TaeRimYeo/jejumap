@@ -249,8 +249,12 @@ zones = load_zones(zones_mtime())
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
                           patrols=st.session_state.patrols) if zones else None)
 
-tab_map, tab_report, tab_list, tab_check = st.tabs(
-    ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
+if st.query_params.get("go") == "report":       # 제보용 QR(?go=report)로 들어오면 제보 탭이 맨 앞
+    tab_report, tab_map, tab_list, tab_check = st.tabs(
+        ["📸 쓰레기 제보", "🗺️ 위험도 지도", "📋 우선 수거 리포트", "🔬 가중치 검증"])
+else:
+    tab_map, tab_report, tab_list, tab_check = st.tabs(
+        ["🗺️ 위험도 지도", "📸 쓰레기 제보", "📋 우선 수거 리포트", "🔬 가중치 검증"])
 
 # ---------------- 1. 지도 ----------------
 with tab_map:
@@ -398,9 +402,11 @@ with tab_report:
             st.image(photo, use_container_width=True)
 
         opts = ["지도에서 직접 선택"] + list(beaches.name)
-        where = st.selectbox("어디인가요?", opts, index=1)
+        where = st.selectbox("어디인가요?", opts, index=None, placeholder="해변을 고르거나 '지도에서 직접 선택'")
         lat = lon = None
-        if where == "지도에서 직접 선택":
+        if where is None:
+            st.caption("위치를 골라야 제보할 수 있어요.")
+        elif where == "지도에서 직접 선택":
             pm = folium.Map(location=[33.38, 126.55], zoom_start=10, tiles="OpenStreetMap")
             click = st_folium(pm, height=320, use_container_width=True, key="pick",
                               returned_objects=["last_clicked"])

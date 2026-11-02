@@ -1,0 +1,20 @@
+name: QR 만들기
+on:
+  workflow_dispatch: {}
+jobs:
+  qr:
+    runs-on: ubuntu-latest
+    steps:
+      - run: pip install "qrcode[pil]==7.4.2"
+      - run: |
+          python - <<'PY'
+          import qrcode
+          for name, url in [("qr_report", "https://jeju-coast-map.streamlit.app/?go=report"),
+                            ("qr_main", "https://jeju-coast-map.streamlit.app/")]:
+              img = qrcode.make(url, box_size=12, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
+              img.save(f"{name}.png")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qr
+          path: "*.png"
