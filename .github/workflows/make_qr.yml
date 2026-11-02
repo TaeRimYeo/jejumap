@@ -14,7 +14,4 @@ jobs:
               img = qrcode.make(url, box_size=12, border=4, error_correction=qrcode.constants.ERROR_CORRECT_M)
               img.save(f"{name}.png")
           PY
-      - uses: actions/upload-artifact@v4
-        with:
-          name: qr
-          path: "*.png"
+      - run: for f in *.png; do echo "QRFILE $f"; base64 -w0 "$f"; echo; echo "QREND"; done
