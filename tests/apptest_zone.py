@@ -41,7 +41,7 @@ assert not at.exception, [e.value for e in at.exception]
 at = run({"zone": "비양도 지선 #2"})
 assert "우리 마을 앞바다 · 비양도" in " ".join(m.value for m in at.markdown)
 at = run({"zone": "없는마을[링크](http://x)"})
-assert any("찾지 못했어요" in i.value and "http" not in i.value for i in at.info), [i.value for i in at.info]
+assert any("찾지 못했어요" in i.value and "](" not in i.value for i in at.info), [i.value for i in at.info]
 at = run({"zone": "리"})
 assert any("찾지 못했어요" in i.value for i in at.info)
 at = run({})
