@@ -5,6 +5,7 @@ import hashlib
 import io
 import hmac
 import json
+import re
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -251,6 +252,13 @@ cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session
 
 def record_patrol(pz, pwho, clear, wildlife=None):
     """순찰 '이상 없음' 기록 (+ 구역 안 재확인 지점은 수거 완료 처리, 관찰한 생물)."""
+    wildlife = [w for w in (wildlife or []) if w in core.WILDLIFE]
+    same = [p for p in st.session_state.patrols if p.get("zone") == pz and p.get("date") == TODAY.isoformat()
+            and set(p.get("wildlife") or []) >= set(wildlife)]
+    if same:                                   # 같은 날 같은 구역을 또 누르면 중복 기록하지 않음
+        st.session_state.flash_patrol = f"🧭 **{pz}** 는 오늘 이미 순찰 기록이 있어요" + (
+            f" (관찰 생물 {', '.join(same[-1].get('wildlife') or [])})." if same[-1].get("wildlife") else ".")
+        st.rerun()
     now = now_kst()
     pid = now.strftime("%Y%m%d%H%M%S%f")
     logged = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -263,6 +271,8 @@ def record_patrol(pz, pwho, clear, wildlife=None):
                                      + (f" 수거 완료 처리: {', '.join(clear)}" if clear else "")
                                      + (f"  \n🐢 관찰한 생물: {', '.join(wildlife)} → 이 구역은 생물 서식 확인 지역으로 "
                                         f"위험 지수·순찰 순서를 {core.WILDLIFE_BONUS}배로 봐요." if wildlife else ""))
+    for k in ("patrol_who", "patrol_wild", "v_patrol_who", "v_patrol_wild"):    # 다음 기록 때 이전 입력이 남지 않게
+        st.session_state.pop(k, None)
     st.rerun()
 
 
@@ -311,7 +321,8 @@ if VZONE and cov is not None:
         if st.session_state.get("flash_patrol"):
             st.success(st.session_state.pop("flash_patrol"))
 elif st.query_params.get("zone"):
-    st.info(f"'{st.query_params.get('zone')}' 구역을 찾지 못했어요. 📋 우선 수거 리포트 탭의 '우리 마을 앞바다'에서 골라 주세요.")
+    _q = re.sub(r"[^0-9A-Za-z가-힣 #]", "", str(st.query_params.get("zone")))[:20]    # 주소 값을 그대로 화면에 쓰지 않음
+    st.info(f"'{_q}' 구역을 찾지 못했어요. 📋 우선 수거 리포트 탭의 '우리 마을 앞바다'에서 골라 주세요.")
 
 if st.query_params.get("go") == "report":       # 제보용 QR(?go=report)로 들어오면 제보 탭이 맨 앞
     tab_report, tab_map, tab_list, tab_check = st.tabs(
@@ -589,9 +600,11 @@ with tab_list:
         st.caption("수거 완료·순찰 기록은 지킴이 코드가 있어야 할 수 있어요. 목록 보기와 CSV 다운로드는 누구나 가능합니다.")
     if zones:
         zn = sorted((z["properties"]["name"] for z in zones), key=core.short_zone)
+        zemd = {z["properties"]["name"]: z["properties"]["emd"] for z in zones}
         zsel = st.selectbox("🏘️ 우리 마을 앞바다 보기 (주소 뒤 ?zone=평대리 처럼 열 수 있어요, 화면 맨 위에 나와요)",
                             ["선택 안 함"] + zn, index=(zn.index(VZONE) + 1) if VZONE in zn else 0,
-                            format_func=lambda n: n if n == "선택 안 함" else f"{core.short_zone(n)} ({n})", key="view_zone")
+                            format_func=lambda n: n if n == "선택 안 함" else f"{core.short_zone(n)} · {zemd.get(n, '')} ({n})",
+                            key="view_zone")
         if zsel != "선택 안 함" and zsel != VZONE:
             sz = core.short_zone(zsel)                 # 짧은 이름이 겹치면(예: 비양도 #2) 전체 이름으로
             st.query_params["zone"] = sz if core.find_zone(zones, sz) == zsel else zsel
@@ -864,7 +877,8 @@ with tab_check:
     rb_args = (json.dumps(REPORTS, ensure_ascii=False),
                json.dumps(st.session_state.cleanups, ensure_ascii=False), winter, TODAY.isoformat())
     if st.session_state.get("rb_args") != rb_args:
-        st.caption("가중치 조합 수백 개로 순위를 다시 계산합니다. 제보·수거 기록이 바뀌면 다시 눌러 주세요.")
+        st.caption("가중치 조합 수백 개로 순위를 다시 계산합니다. 제보·수거 기록이 바뀌면 다시 눌러 주세요. "
+                   f"(순찰 때 관찰한 생물 가중 {core.WILDLIFE_BONUS}배는 이 분석에 넣지 않은 기본 공식 기준입니다)")
         if st.button("▶️ 민감도 분석 실행 (5–10초)", type="primary"):
             st.session_state.rb_result = cached_robustness(*rb_args)
             st.session_state.rb_args = rb_args

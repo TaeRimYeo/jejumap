@@ -24,6 +24,15 @@ succ = [s.value for s in at.success]
 print("patrol ok:", succ[:3])
 assert any("흰물떼새" in v for v in succ), succ
 assert any("최근 관찰한 생물: 흰물떼새" in c.value for c in at.code), [c.value for c in at.code]
+# 입력이 초기화됐는지, 같은 날 다시 누르면 중복 기록 안 되는지
+ms = next(m for m in at.multiselect if m.key == "v_patrol_wild")
+assert ms.value == [], ms.value
+n_before = len(at.session_state["patrols"])
+next(b for b in at.button if "이상 없어요" in b.label).click().run()
+assert not at.exception, [e.value for e in at.exception]
+assert len(at.session_state["patrols"]) == n_before, "중복 순찰 기록됨"
+assert any("이미 순찰 기록" in s.value for s in at.success), [s.value for s in at.success]
+print("dup ok")
 # 다른 탭(리포트 표·민감도 화면)도 오류 없이
 at.query_params["zone"] = "사계리"
 at.run()
@@ -31,7 +40,9 @@ assert not at.exception, [e.value for e in at.exception]
 
 at = run({"zone": "비양도 지선 #2"})
 assert "우리 마을 앞바다 · 비양도" in " ".join(m.value for m in at.markdown)
-at = run({"zone": "없는마을"})
+at = run({"zone": "없는마을[링크](http://x)"})
+assert any("찾지 못했어요" in i.value and "http" not in i.value for i in at.info), [i.value for i in at.info]
+at = run({"zone": "리"})
 assert any("찾지 못했어요" in i.value for i in at.info)
 at = run({})
 assert not any("우리 마을 앞바다 ·" in m.value for m in at.markdown)

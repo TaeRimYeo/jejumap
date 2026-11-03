@@ -932,7 +932,8 @@ def export_geojson(table, today=None):
                                      "risk_index": None if pd.isna(r.risk_index) else float(r.risk_index),
                                      "evidence": int(r.evidence), "reports": int(r.report_count),
                                      "last_date": r.last_date, "last_cleanup": r.last_cleanup,
-                                     "village_fishery": bool(r.village_fishery)}})
+                                     "village_fishery": bool(r.village_fishery),
+                                     "wildlife": getattr(r, "wildlife", "") or ""}})
     return json.dumps({"type": "FeatureCollection", "name": "jeju_coast_risk",
                        "generated": str(_to_date(today) or _dt.date.today()), "features": feats}, ensure_ascii=False)
 
@@ -948,7 +949,8 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
     if len(top):
         for k, r in enumerate(top.itertuples(), 1):
             lines.append(f"  {k}. {r.name} – 위험 지수 {r.risk_index:.2f}, {r.status}"
-                         + (f", 마지막 근거 {r.last_date}" if r.last_date else ""))
+                         + (f", 마지막 근거 {r.last_date}" if r.last_date else "")
+                         + (f", 관찰 생물 {r.wildlife}" if getattr(r, "wildlife", "") else ""))
             lines.append(f"     작업량 {r.workload} → {r.crew}")
     else:
         lines.append("  근거가 있는 지점이 없습니다(아래 확인 공백 구역 순찰 필요).")
@@ -1025,7 +1027,10 @@ def find_zone(zones, query):
     if not q:
         return None
     names = [z["properties"]["name"] for z in zones]
-    for cand in (lambda n: n == q, lambda n: short_zone(n) == q, lambda n: q in n):
+    cands = [lambda n: n == q, lambda n: short_zone(n) == q]
+    if len(q) >= 2:                                   # '리' 한 글자로 아무 구역이나 열리지 않게
+        cands.append(lambda n: q in n)
+    for cand in cands:
         hit = [n for n in names if cand(n)]
         if hit:
             return hit[0]
