@@ -244,7 +244,7 @@ if "sid" not in st.session_state:          # 익명 세션 표시(개인정보 �
 REPORTS = core.apply_reviews(st.session_state.reports, st.session_state.reviews)   # 검토 결과 반영본
 
 zones = load_zones(zones_mtime())
-WILD = core.wildlife_by_zone(st.session_state.patrols, TODAY)     # 순찰 때 관찰한 생물 (최근 1년)
+WILD = core.wildlife_by_zone(st.session_state.patrols, TODAY, reports=REPORTS)     # 순찰 때 관찰한 생물 (최근 1년)
 table = core.apply_wildlife(core.build_table(beaches, REPORTS, winter, records,
                                              today=TODAY, cleanups=st.session_state.cleanups), zones, WILD)
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
@@ -712,6 +712,59 @@ with tab_list:
                 st.rerun()
         if st.session_state.get("flash_import"):
             st.success(st.session_state.pop("flash_import"))
+
+    with st.expander("🏘️ 주민·시민단체 모니터링 기록 가져오기 (마을 앞바다·사구 돌보기 기록)"):
+        st.caption("마을 주민이나 시민단체가 모은 모니터링 기록을 그대로 올리면 행정이 보는 지도에 들어갑니다. "
+                   "**쓰레기 없음** → 순찰 '이상 없음'(확인 공백에서 빠짐) · **쓰레기 있음** → 확인된 제보(위험 순위) · "
+                   f"**관찰한 생물** → 생물 서식 확인 구역(위험 지수·순찰 순서 {core.WILDLIFE_BONUS}배). "
+                   "필수 열: 날짜 + 마을(예: 평대리) 또는 위도·경도. 같은 파일을 두 번 올려도 한 번만 반영돼요.")
+        st.download_button("모니터링 양식 CSV 받기", core.MONITOR_TEMPLATE.encode("utf-8-sig"),
+                           file_name="주민모니터링_양식.csv", mime="text/csv")
+        mup = st.file_uploader("모니터링 CSV 올리기", type=["csv"], key="monitor_csv", disabled=not keeper)
+        if mup is not None and zones:
+            try:
+                raw = mup.getvalue()
+                try:
+                    mdf = pd.read_csv(io.BytesIO(raw), encoding="utf-8-sig", dtype=str)
+                except UnicodeDecodeError:
+                    mdf = pd.read_csv(io.BytesIO(raw), encoding="cp949", dtype=str)
+                m_pat, m_rep, m_skip = core.parse_monitoring(mdf.head(2000), beaches, zones)
+            except Exception as e:
+                m_pat, m_rep, m_skip = [], [], [(0, f"파일을 읽지 못했어요: {str(e)[:80]}")]
+            have_p = {p.get("_id") for p in st.session_state.patrols}
+            have_r = {r.get("_id") for r in st.session_state.reports}
+            new_p = [p for p in m_pat if p["_id"] not in have_p]
+            new_r = [r for r in m_rep if r["_id"] not in have_r]
+            n_wild = sum(1 for x in new_p + new_r if x.get("wildlife"))
+            st.write(f"읽은 행 {len(m_pat) + len(m_rep) + len(m_skip)} · 새로 넣을 기록: 순찰(이상 없음) **{len(new_p)}건**, "
+                     f"쓰레기 **{len(new_r)}건**, 그중 생물 관찰 **{n_wild}건** · 이미 있음 "
+                     f"{len(m_pat) + len(m_rep) - len(new_p) - len(new_r)} · 건너뜀 {len(m_skip)}")
+            if new_p or new_r:
+                prev = pd.DataFrame([{"날짜": x.get("date") or x.get("time", "")[:10], "해안 구역": x.get("zone"),
+                                      "구분": "쓰레기 " + core.LABEL.get(x["category"], "") if "category" in x else "이상 없음",
+                                      "관찰한 생물": ", ".join(x.get("wildlife") or []),
+                                      "단체": x.get("channel", "")} for x in new_p + new_r])
+                st.dataframe(prev.head(30), hide_index=True, use_container_width=True)
+            if m_skip:
+                st.dataframe(pd.DataFrame(m_skip, columns=["행", "이유"]).head(20), hide_index=True)
+            if (new_p or new_r) and st.button(f"{len(new_p) + len(new_r)}건 가져오기", type="primary",
+                                              disabled=not keeper, key="monitor_go"):
+                try:
+                    if new_p:
+                        store.add_many("patrols", new_p)
+                        st.session_state.patrols += new_p
+                    if new_r:
+                        store.add_many("reports", new_r)
+                        st.session_state.reports += new_r
+                    st.session_state.my_ids += [x["_id"] for x in new_p + new_r]
+                    st.session_state.flash_monitor = (f"🏘️ 모니터링 기록 {len(new_p) + len(new_r)}건을 가져왔어요. "
+                                                      "확인 공백·위험 순위·마을 화면에 반영됐습니다.")
+                except store_mod.StoreError as e:
+                    print("[monitor import]", e)
+                    st.session_state.flash_monitor = "가져오기 저장에 실패했어요. 잠시 후 다시 해주세요."
+                st.rerun()
+        if st.session_state.get("flash_monitor"):
+            st.success(st.session_state.pop("flash_monitor"))
 
     st.divider()
     st.markdown("#### ✅ 수거 완료 처리")

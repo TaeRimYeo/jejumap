@@ -1081,11 +1081,13 @@ WILDLIFE_BONUS = 1.2
 WILDLIFE_DAYS = 365
 
 
-def wildlife_by_zone(patrols, today=None, days=WILDLIFE_DAYS):
-    """{구역 이름: {생물: 마지막 관찰일}} (최근 days일)."""
+def wildlife_by_zone(patrols, today=None, days=WILDLIFE_DAYS, reports=None):
+    """{구역 이름: {생물: 마지막 관찰일}} (최근 days일). 가져온 모니터링 제보(zone·wildlife 있는 것)도 포함."""
     today = _to_date(today) or _dt.date.today()
     out = {}
-    for p in patrols or []:
+    extra = [{"zone": r.get("zone"), "date": str(r.get("time", ""))[:10], "wildlife": r.get("wildlife")}
+             for r in reports or [] if r.get("wildlife") and r.get("zone") and r.get("review") != "reject"]
+    for p in list(patrols or []) + extra:
         d = _to_date(p.get("date"))
         sp = p.get("wildlife") or []
         if not d or not sp or (today - d).days > days or not p.get("zone"):
@@ -1116,3 +1118,109 @@ def apply_wildlife(table, zones, wild):
 
 def wildlife_text(sp):
     return ", ".join(f"{s}({d:%m.%d})" for s, d in sorted(sp.items(), key=lambda kv: kv[1], reverse=True))
+
+
+# ---------------- 주민·시민단체 모니터링 기록 가져오기 ----------------
+# 마을 주민 모니터링(예: 사구·앞바다 돌보기) 기록을 그대로 올리면
+#   쓰레기 없음 → 순찰 '이상 없음'(확인 공백에서 빠짐), 쓰레기 있음 → 확인된 제보(위험 순위),
+#   관찰한 생물 → 생물 서식 확인 구역(위험 지수·순찰 순서 1.2배) 으로 들어간다.
+MONITOR_COLUMNS = {"date": ["date", "날짜", "일자", "조사일", "모니터링일"],
+                   "zone": ["zone", "마을", "구역", "해안 구역", "지선"],
+                   "lat": ["lat", "위도"], "lon": ["lon", "lng", "경도"],
+                   "trash": ["trash", "쓰레기", "쓰레기 유무", "쓰레기 있음"],
+                   "category": ["category", "종류", "쓰레기 종류"],
+                   "wildlife": ["wildlife", "관찰한 생물", "생물", "관찰 생물", "생물종"],
+                   "org": ["org", "단체", "기관", "모니터링 단체", "출처"],
+                   "note": ["note", "메모", "비고"]}
+MONITOR_TEMPLATE = ("날짜,마을,위도,경도,쓰레기,종류,관찰한 생물,단체,메모\n"
+                    "2026-11-01,평대리,,,없음,,흰물떼새,OO 마을 모니터링단,예시 행입니다 - 지우고 쓰세요\n"
+                    "2026-11-01,,33.4975,126.4518,있음,플라스틱,,OO 시민단체,예시 행입니다 - 지우고 쓰세요\n")
+WILDLIFE_ALIASES = [("돌고래", "남방큰돌고래"), ("거북", "바다거북"), ("물떼새", "흰물떼새"),
+                    ("감태", "해조류 숲(감태·모자반 등)"), ("모자반", "해조류 숲(감태·모자반 등)"),
+                    ("미역", "해조류 숲(감태·모자반 등)"), ("해조", "해조류 숲(감태·모자반 등)"),
+                    ("전복", "전복·소라"), ("소라", "전복·소라"), ("산호", "산호·해면"), ("해면", "산호·해면"),
+                    ("갈매기", "물새(기타)"), ("백로", "물새(기타)"), ("가마우지", "물새(기타)"), ("물새", "물새(기타)"),
+                    ("물떼", "흰물떼새"), ("도요", "물새(기타)")]
+_YES = {"있음", "있다", "o", "y", "yes", "1", "true", "예", "많음", "보통", "적음"}
+_NO = {"없음", "없다", "x", "n", "no", "0", "false", "아니오", "이상 없음", "깨끗"}
+
+
+def norm_wildlife(v):
+    """'흰물떼새 3마리, 감태' → ['흰물떼새', '해조류 숲(감태·모자반 등)']. 모르는 이름은 건너뜀."""
+    out = []
+    for part in re.split(r"[,/·;\n]+", str(v or "")):
+        part = part.strip()
+        if not part:
+            continue
+        hit = next((s for s in WILDLIFE if s == part), None) or next((s for k, s in WILDLIFE_ALIASES if k in part), None)
+        if hit and hit not in out:
+            out.append(hit)
+    return out
+
+
+def parse_monitoring(df, beaches, zones, default_org="주민 모니터링"):
+    """주민·시민단체 모니터링 CSV → (순찰 기록, 제보 기록, 건너뛴 행). 같은 행은 같은 id라 두 번 올려도 한 번만."""
+    cols = {}
+    for key, names in MONITOR_COLUMNS.items():
+        for c in df.columns:
+            if str(c).strip().lower() in [n.lower() for n in names]:
+                cols[key] = c
+                break
+    if "date" not in cols or not ("zone" in cols or ("lat" in cols and "lon" in cols)):
+        return [], [], [(0, "필수 열이 없어요: 날짜 + (마을 또는 위도·경도)")]
+    get = lambda row, k: (str(row[cols[k]]).strip() if k in cols and pd.notna(row[cols[k]]) else "")
+    zprops = {z["properties"]["name"]: z["properties"] for z in zones}
+    patrols, reports, skipped = [], [], []
+    for i, row in df.iterrows():
+        n = i + 2
+        note = get(row, "note")
+        if "예시" in note:
+            skipped.append((n, "예시 행이라 건너뜀"))
+            continue
+        dv = pd.to_datetime(get(row, "date").replace(".", "-").replace("/", "-").rstrip("-"), errors="coerce")
+        if pd.isna(dv):
+            skipped.append((n, "날짜를 읽을 수 없어요"))
+            continue
+        d = dv.date()
+        lat = lon = None
+        try:
+            if get(row, "lat") and get(row, "lon"):
+                lat, lon = float(get(row, "lat")), float(get(row, "lon"))
+        except ValueError:
+            lat = lon = None
+        zname = find_zone(zones, get(row, "zone")) if get(row, "zone") else None
+        if zname is None and lat is not None:
+            if not in_jeju(lat, lon):
+                skipped.append((n, "제주 범위 밖 좌표"))
+                continue
+            zi = nearest_zone(zones, lat, lon)
+            zname = zones[zi]["properties"]["name"] if zi is not None else None
+        if zname is None:
+            skipped.append((n, f"마을(해안 구역)을 찾지 못했어요: {get(row, 'zone') or '좌표'}"))
+            continue
+        zp = zprops[zname]
+        if lat is None:
+            lat, lon = zp["lat"], zp["lon"]
+        org = get(row, "org") or default_org
+        wild = norm_wildlife(get(row, "wildlife"))
+        tv = get(row, "trash").lower()
+        cat = _norm_category(get(row, "category")) if get(row, "category") else None
+        has_trash = (tv in _YES) or (tv == "" and cat is not None) or (tv not in _NO and tv != "" and cat is not None)
+        memo = scrub_memo(note)
+        rid = hashlib.sha1(f"{org}|{d}|{zname}|{has_trash}|{cat}|{','.join(wild)}|{lat:.5f}|{lon:.5f}".encode()).hexdigest()[:24]
+        if has_trash:
+            cat = cat or "other"
+            near, dist = nearest_point(beaches, lat, lon)
+            attach = near["name"] if dist <= ATTACH_M else None
+            reports.append({"_id": "mon_" + rid, "time": f"{d.isoformat()} 12:00:00",
+                            "place": near["name"] if attach else f"{org} 기록 ({short_zone(zname)})",
+                            "lat": round(lat, 5), "lon": round(lon, 5), "emd": guess_emd(lat, lon, beaches, zones),
+                            "category": cat, "near_fishery": bool(near.village_fishery) if attach else zp.get("kind") != "항만",
+                            "coast_side": coast_side(lat, lon), "attach_to_name": attach, "ai": False,
+                            "sid": "import:" + org, "channel": org, "review": "ok", "note": memo,
+                            "zone": zname, "wildlife": wild})
+        else:
+            patrols.append({"_id": "mon_" + rid, "zone": zname, "date": d.isoformat(),
+                            "by": f"{org}" + (f" · {memo}" if memo else ""), "logged": f"{d.isoformat()} 12:00:00",
+                            "id": "mon_" + rid, "cleared": [], "wildlife": wild, "channel": org})
+    return patrols, reports, skipped
