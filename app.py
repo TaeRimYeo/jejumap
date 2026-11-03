@@ -242,25 +242,27 @@ if "sid" not in st.session_state:          # 익명 세션 표시(개인정보 �
     st.session_state.sid = store_mod.new_id()[:12]
 REPORTS = core.apply_reviews(st.session_state.reports, st.session_state.reviews)   # 검토 결과 반영본
 
-table = core.build_table(beaches, REPORTS, winter, records,
-                         today=TODAY, cleanups=st.session_state.cleanups)
-
 zones = load_zones(zones_mtime())
+WILD = core.wildlife_by_zone(st.session_state.patrols, TODAY)     # 순찰 때 관찰한 생물 (최근 1년)
+table = core.apply_wildlife(core.build_table(beaches, REPORTS, winter, records,
+                                             today=TODAY, cleanups=st.session_state.cleanups), zones, WILD)
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
-                          patrols=st.session_state.patrols) if zones else None)
+                          patrols=st.session_state.patrols, wild=WILD) if zones else None)
 
-def record_patrol(pz, pwho, clear):
-    """순찰 '이상 없음' 기록 (+ 구역 안 재확인 지점은 수거 완료 처리)."""
+def record_patrol(pz, pwho, clear, wildlife=None):
+    """순찰 '이상 없음' 기록 (+ 구역 안 재확인 지점은 수거 완료 처리, 관찰한 생물)."""
     now = now_kst()
     pid = now.strftime("%Y%m%d%H%M%S%f")
     logged = now.strftime("%Y-%m-%d %H:%M:%S")
     persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
-                        "id": pid, "cleared": clear})
+                        "id": pid, "cleared": clear, "wildlife": list(wildlife or [])})
     for site in clear:
         persist("cleanups", {"site": site, "date": TODAY.isoformat(), "logged": logged,
                              "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""), "patrol": pid})
     st.session_state.flash_patrol = (f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
-                                     + (f" 수거 완료 처리: {', '.join(clear)}" if clear else ""))
+                                     + (f" 수거 완료 처리: {', '.join(clear)}" if clear else "")
+                                     + (f"  \n🐢 관찰한 생물: {', '.join(wildlife)} → 이 구역은 생물 서식 확인 지역으로 "
+                                        f"위험 지수·순찰 순서를 {core.WILDLIFE_BONUS}배로 봐요." if wildlife else ""))
     st.rerun()
 
 
@@ -282,6 +284,9 @@ if VZONE and cov is not None:
         v4.metric("이 앞바다 지점", len(zpts))
         if zrow["state"] != "최근 확인":
             st.warning("기록이 없다는 건 깨끗하다는 뜻이 아니라 **모른다**는 뜻이에요. 한 번 둘러보고 아래에 남겨 주세요.")
+        if zrow.get("wildlife"):
+            st.success(f"🐢 최근 1년 관찰한 생물: **{zrow['wildlife']}** — 생물이 사는 곳으로 보고 위험 지수·순찰 순서를 "
+                       f"{core.WILDLIFE_BONUS}배로 봐요.")
         if len(zpts):
             zv = zpts[["name", "risk_index", "status", "evidence"]].copy()
             zv["risk_index"] = zv["risk_index"].round(2)
@@ -297,8 +302,10 @@ if VZONE and cov is not None:
             vkeeper = (not _secret("ADMIN_CODE")) or bool(st.session_state.get("keeper"))
             vwho = core.scrub_memo(st.text_input("순찰자 / 메모 (선택, 이름·연락처 쓰지 마세요)", key="v_patrol_who",
                                                  max_chars=core.MEMO_MAX, placeholder="예: 평대리 주민 모니터링, 흰물떼새 2마리"))
+            vwild = st.multiselect("🐢 관찰한 생물 (선택)", core.WILDLIFE, key="v_patrol_wild",
+                                   help="생물이 확인된 구역은 위험 지수와 순찰 순서를 더 높게 봐요 (복원 기록도 됨)")
             if st.button("🧭 둘러봤는데 이상 없어요 (순찰 기록)", use_container_width=True, disabled=not vkeeper):
-                record_patrol(VZONE, vwho, core.stale_points_in_zone(table, zones, VZONE))
+                record_patrol(VZONE, vwho, core.stale_points_in_zone(table, zones, VZONE), vwild)
             if not vkeeper:
                 st.caption("순찰 기록은 지킴이 코드가 있어야 해요 (📋 우선 수거 리포트 탭에서 입력).")
         if st.session_state.get("flash_patrol"):
@@ -546,8 +553,8 @@ with tab_report:
             st.session_state.my_report_times = recent + [time.time()]
             saved = persist("reports", new_rep)
             st.session_state.pop("ai", None)
-            new = core.build_table(beaches, core.apply_reviews(st.session_state.reports, st.session_state.reviews),
-                                   winter, records, today=TODAY, cleanups=st.session_state.cleanups)
+            new = core.apply_wildlife(core.build_table(beaches, core.apply_reviews(st.session_state.reports, st.session_state.reviews),
+                                   winter, records, today=TODAY, cleanups=st.session_state.cleanups), zones, WILD)
             after, _ = core.nearest_point(new, lat, lon)     # 이름이 '#2'로 바뀌어도 위치로 찾음
             place = after["name"]
             st.session_state.stamps.add(place)
@@ -613,10 +620,10 @@ with tab_list:
     rep = core.priority(table_v, 5)
     rep = rep.assign(순위=range(1, len(rep) + 1))[
         ["순위", "name", "emd", "risk_index", "status", "workload", "crew", "adj_hazard", "evidence", "record_count",
-         "report_count", "village_fishery", "dolphin_basis"]]
+         "report_count", "village_fishery", "dolphin_basis", "wildlife"]]
     rep["adj_hazard"] = rep["adj_hazard"].round(2)
     rep.columns = ["순위", "지점", "읍면동", "위험 지수", "상태", "작업량", "권장 인력·장비", "보정 위해성", "근거 수",
-                   "기관 기록", "제보 수", "마을어장 인접", "돌고래 근거"]
+                   "기관 기록", "제보 수", "마을어장 인접", "돌고래 근거", "관찰한 생물"]
     rep["돌고래 근거"] = rep["돌고래 근거"].fillna("")
     st.caption("위험 지수가 같으면 근거가 많은 곳이 먼저입니다. 근거 1건인 지점은 현장 확인을 권장합니다. "
                "**'검토 대기'** 는 검토 전 시민 제보만 있는 곳이라, 출동 전에 아래 🛡️ 제보 검토에서 사진·현장을 확인하세요.")
@@ -750,14 +757,18 @@ with tab_list:
         clear = core.stale_points_in_zone(table, zones, pz)
         if clear:
             st.caption("이 구역의 재확인 필요 지점 → 함께 수거 완료 처리: **" + ", ".join(clear) + "**")
+        pwild = st.multiselect("🐢 순찰 중 관찰한 생물 (선택 · 생물이 확인된 구역은 위험 지수와 순찰 순서를 "
+                               f"{core.WILDLIFE_BONUS}배로 봐요)", core.WILDLIFE, key="patrol_wild")
         if pz3.button("이상 없음 기록", use_container_width=True, disabled=not keeper):
-            record_patrol(pz, pwho, clear)
+            record_patrol(pz, pwho, clear, pwild)
         if st.session_state.get("flash_patrol"):
             st.success(st.session_state.pop("flash_patrol"))
         if st.session_state.patrols:
-            plog = pd.DataFrame(st.session_state.patrols).reindex(columns=["date", "zone", "by", "cleared", "logged"])
-            plog["cleared"] = plog["cleared"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
-            plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "함께 수거 완료 처리", "기록 시각"]
+            plog = pd.DataFrame(st.session_state.patrols).reindex(
+                columns=["date", "zone", "by", "wildlife", "cleared", "logged"])
+            for c in ("cleared", "wildlife"):
+                plog[c] = plog[c].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+            plog.columns = ["순찰일", "해안 구역", "순찰자/메모", "관찰한 생물", "함께 수거 완료 처리", "기록 시각"]
             st.dataframe(plog.iloc[::-1], hide_index=True, use_container_width=True)
             last = my_last("patrols")
             if keeper and last and st.button(f"↩️ 내가 한 마지막 순찰 기록 되돌리기 ({last['zone']})"):
@@ -836,8 +847,8 @@ with tab_check:
     w = core.default_weights()
     w["hazard"].update(fishing_gear=fg, plastic=pl, styrofoam=pl, seaweed=ot, other=ot)
     w.update(dolphin_scale=ds, fishery=fi, prior_k=kk, hl_event=hl)
-    custom = core.build_table(beaches, REPORTS, winter, records, w,
-                              today=TODAY, cleanups=st.session_state.cleanups)
+    custom = core.apply_wildlife(core.build_table(beaches, REPORTS, winter, records, w,
+                                                  today=TODAY, cleanups=st.session_state.cleanups), zones, WILD)
     base_t = table[table.risk_index.notna()].set_index("name")
     cus_t = custom[custom.risk_index.notna()].set_index("name")
     base_r = base_t.risk_index.rank(ascending=False, method="min").astype(int)

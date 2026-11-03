@@ -472,7 +472,7 @@ def nearest_zone(zones, lat, lon, max_m=ZONE_ATTACH_M):
     return i if dm <= max_m else None
 
 
-def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=None, patrols=None):
+def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=None, patrols=None, wild=None):
     """구역마다 마지막으로 누군가 확인한 날을 계산. 확인 = 공공 조사·기관 기록·시민 제보·수거 완료·순찰(이상 없음).
     근거는 자기 위치로 가장 가까운 구역(1.5km 이내)에 붙임. 위치가 없는 근거와 수거 완료는 지점 위치를 씀.
     제보가 없다는 건 '깨끗하다'가 아니라 '모른다'이므로 확인 기록 없음 / 오래전 확인을 따로 드러내고,
@@ -506,6 +506,9 @@ def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=No
         side = coast_side(p["lat"], p["lon"])
         port = p.get("kind") == "항만"
         sens = sensitivity(p["emd"], not port, side, winter_on, w)    # 마을어장 구역은 어장 가중, 항만은 제외
+        seen_sp = (wild or {}).get(p["name"]) or {}
+        if seen_sp:                                                  # 생물이 관찰된 구역은 먼저 살핌
+            sens *= WILDLIFE_BONUS
         hits = seen.get(i, [])
         last = max(d for d, _ in hits) if hits else None
         days = (today - last).days if last else None
@@ -514,7 +517,8 @@ def zone_coverage(table, zones, winter_on=False, w=None, today=None, cleanups=No
                     "emd": p["emd"], "lat": p["lat"], "lon": p["lon"],
                     "coast_side": side, "dolphin": dolphin_weight(p["emd"], w), "sensitivity": round(sens, 2),
                     "last_check": last.isoformat() if last else "", "days_since": days, "state": state,
-                    "points": ", ".join(sorted({n for _, n in hits}))})
+                    "points": ", ".join(sorted({n for _, n in hits})),
+                    "wildlife": wildlife_text(seen_sp) if seen_sp else ""})
     df = pd.DataFrame(out)
     order = {s: k for k, s in enumerate(ZONE_STATES)}
     df["_o"] = df.state.map(order)
@@ -1053,6 +1057,8 @@ def village_briefing(zone_row, pts, today=None, short_unique=True):
     if z.get("kind", "마을어장") == "마을어장":
         sens.append("마을어장")
     lines.append("• " + " · ".join(sens))
+    if z.get("wildlife"):
+        lines.append(f"• 최근 관찰한 생물: {z['wildlife']}")
     if len(pts):
         lines.append("• 이 앞바다 지점")
         for r in pts.sort_values("risk_index", ascending=False, na_position="last").head(3).itertuples():
@@ -1060,3 +1066,48 @@ def village_briefing(zone_row, pts, today=None, short_unique=True):
     lines += ["", "할 일: 쓰레기가 있으면 사진 제보, 없으면 순찰 '이상 없음' 기록",
               f"우리 마을 화면: {APP_URL}?zone={short if short_unique else z['zone'].replace(' ', '%20')}"]
     return "\n".join(lines)
+
+
+# ---------------- 관찰한 생물 (주민·지킴이 생물 기록) ----------------
+# 순찰 때 본 생물을 남기면, 그 구역은 '생물이 실제로 사는 곳'으로 보고 위험 지수·순찰 민감도를 높인다.
+# 가중치 1.2는 팀이 정한 가정값(측정값 아님). 최근 1년 기록만 씀.
+WILDLIFE = ["남방큰돌고래", "바다거북", "흰물떼새", "물새(기타)", "해조류 숲(감태·모자반 등)", "전복·소라", "산호·해면"]
+WILDLIFE_BONUS = 1.2
+WILDLIFE_DAYS = 365
+
+
+def wildlife_by_zone(patrols, today=None, days=WILDLIFE_DAYS):
+    """{구역 이름: {생물: 마지막 관찰일}} (최근 days일)."""
+    today = _to_date(today) or _dt.date.today()
+    out = {}
+    for p in patrols or []:
+        d = _to_date(p.get("date"))
+        sp = p.get("wildlife") or []
+        if not d or not sp or (today - d).days > days or not p.get("zone"):
+            continue
+        z = out.setdefault(p["zone"], {})
+        for s in sp:
+            if s and (s not in z or z[s] < d):
+                z[s] = d
+    return out
+
+
+def apply_wildlife(table, zones, wild):
+    """생물이 관찰된 구역 안의 지점은 위험 지수 × WILDLIFE_BONUS, 'wildlife' 열에 생물 이름."""
+    t = table.copy()
+    t["wildlife"] = ""
+    if not wild or not zones or not len(t):
+        return t
+    names = [z["properties"]["name"] for z in zones]
+    for i, r in zip(t.index, t.itertuples()):
+        zi = nearest_zone(zones, r.lat, r.lon)
+        sp = wild.get(names[zi]) if zi is not None else None
+        if sp:
+            t.at[i, "wildlife"] = ", ".join(sorted(sp))
+            if pd.notna(r.risk_index):
+                t.at[i, "risk_index"] = round(r.risk_index * WILDLIFE_BONUS, 2)
+    return t
+
+
+def wildlife_text(sp):
+    return ", ".join(f"{s}({d:%m.%d})" for s, d in sorted(sp.items(), key=lambda kv: kv[1], reverse=True))
