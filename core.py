@@ -1003,3 +1003,60 @@ def classify_with_gemini(image_bytes, mime, api_key, model=None, timeout=30):
     parts = r.json()["candidates"][0]["content"]["parts"]
     text = "".join(p.get("text", "") for p in parts)
     return parse_vision_json(text)
+
+
+# ---------------- 마을 앞바다 보기 (?zone=) ----------------
+def short_zone(name):
+    """'평대리 지선' → '평대리', '색달동지선' → '색달동', '제주항 일대' → '제주항' (주소에 붙이기 쉬운 이름)."""
+    n = str(name).split(" #")[0]
+    for suf in (" 지선", "지선", " 일대"):
+        if n.endswith(suf):
+            return n[: -len(suf)].strip()
+    return n.strip()
+
+
+def find_zone(zones, query):
+    """주소의 ?zone= 값(예: 평대리)으로 구역 이름을 찾음. 정확히 같은 이름 → 짧은 이름 → 포함 순서."""
+    q = str(query or "").strip()
+    if not q:
+        return None
+    names = [z["properties"]["name"] for z in zones]
+    for cand in (lambda n: n == q, lambda n: short_zone(n) == q, lambda n: q in n):
+        hit = [n for n in names if cand(n)]
+        if hit:
+            return hit[0]
+    return None
+
+
+def zone_points(table, zones, zone_name):
+    """이 구역(가장 가까운 구역이 이 구역인) 지점들."""
+    idx = {z["properties"]["name"]: i for i, z in enumerate(zones)}.get(zone_name)
+    if idx is None:
+        return table.iloc[0:0]
+    keep = [nearest_zone(zones, r.lat, r.lon) == idx for r in table.itertuples()]
+    return table[keep]
+
+
+def village_briefing(zone_row, pts, today=None, short_unique=True):
+    """마을(어촌계·주민 모임·시민단체) 단톡방에 붙일 '우리 마을 앞바다' 안내."""
+    today = _to_date(today) or _dt.date.today()
+    z = zone_row
+    short = short_zone(z["zone"])
+    lines = [f"[제주 해안 지킴이 지도] {short} 앞바다 ({z['emd']}) · {today:%Y-%m-%d} 기준", ""]
+    last = z.get("last_check") or ""
+    lines.append(f"• 확인 상태: {z['state']}" + (f" (마지막 확인 {last})" if last else ""))
+    if z["state"] != "최근 확인":
+        lines.append("  → 깨끗해서가 아니라 기록이 없는 상태예요. 한 번 둘러보고 남겨 주세요.")
+    sens = [f"민감도 {z['sensitivity']}"]
+    if z.get("dolphin"):
+        sens.append("남방큰돌고래 서식 해역")
+    if z.get("kind", "마을어장") == "마을어장":
+        sens.append("마을어장")
+    lines.append("• " + " · ".join(sens))
+    if len(pts):
+        lines.append("• 이 앞바다 지점")
+        for r in pts.sort_values("risk_index", ascending=False, na_position="last").head(3).itertuples():
+            lines.append(f"  - {r.name}: " + (f"위험 지수 {r.risk_index:.2f}, " if pd.notna(r.risk_index) else "") + f"{r.status}")
+    lines += ["", "할 일: 쓰레기가 있으면 사진 제보, 없으면 순찰 '이상 없음' 기록",
+              f"우리 마을 화면: {APP_URL}?zone={short if short_unique else z['zone'].replace(' ', '%20')}"]
+    return "\n".join(lines)

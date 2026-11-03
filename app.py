@@ -249,6 +249,63 @@ zones = load_zones(zones_mtime())
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
                           patrols=st.session_state.patrols) if zones else None)
 
+def record_patrol(pz, pwho, clear):
+    """순찰 '이상 없음' 기록 (+ 구역 안 재확인 지점은 수거 완료 처리)."""
+    now = now_kst()
+    pid = now.strftime("%Y%m%d%H%M%S%f")
+    logged = now.strftime("%Y-%m-%d %H:%M:%S")
+    persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
+                        "id": pid, "cleared": clear})
+    for site in clear:
+        persist("cleanups", {"site": site, "date": TODAY.isoformat(), "logged": logged,
+                             "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""), "patrol": pid})
+    st.session_state.flash_patrol = (f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
+                                     + (f" 수거 완료 처리: {', '.join(clear)}" if clear else ""))
+    st.rerun()
+
+
+# ---------------- 우리 마을 앞바다 (?zone=평대리) ----------------
+# 마을어장 '지선'은 마을 단위라, 주민·어촌계·시민단체가 자기 앞바다만 보고 기록할 수 있게 한다.
+VZONE = core.find_zone(zones, st.query_params.get("zone", "")) if zones else None
+if VZONE and cov is not None:
+    zrow = cov[cov.zone == VZONE].iloc[0].to_dict()
+    zpts = core.zone_points(table, zones, VZONE)
+    vshort = core.short_zone(VZONE)
+    with st.container(border=True):
+        st.markdown(f"#### 🏘️ 우리 마을 앞바다 · {vshort} ({zrow['emd']})")
+        st.caption("마을어장 지선(마을 단위)으로 나눈 구역이에요. 주민·어촌계·시민단체가 자기 앞바다를 돌보고 기록하면, "
+                   "그 기록이 공백 목록과 읍면동 브리핑에 그대로 들어갑니다.")
+        v1, v2, v3, v4 = st.columns(4)
+        v1.metric("확인 상태", zrow["state"])
+        v2.metric("마지막 확인", zrow["last_check"] or "없음")
+        v3.metric("민감도", zrow["sensitivity"], help="돌고래 서식 해역·마을어장·겨울 북서풍을 곱한 값. 높을수록 먼저 살펴볼 곳")
+        v4.metric("이 앞바다 지점", len(zpts))
+        if zrow["state"] != "최근 확인":
+            st.warning("기록이 없다는 건 깨끗하다는 뜻이 아니라 **모른다**는 뜻이에요. 한 번 둘러보고 아래에 남겨 주세요.")
+        if len(zpts):
+            zv = zpts[["name", "risk_index", "status", "evidence"]].copy()
+            zv["risk_index"] = zv["risk_index"].round(2)
+            zv.columns = ["지점", "위험 지수", "상태", "근거 수"]
+            st.dataframe(zv.sort_values("위험 지수", ascending=False, na_position="last"),
+                         hide_index=True, use_container_width=True)
+        vb1, vb2 = st.columns([3, 2])
+        with vb1:
+            st.code(core.village_briefing(zrow, zpts, TODAY, core.find_zone(zones, vshort) == VZONE), language=None)
+            st.caption("오른쪽 위 복사 버튼 → 마을 단톡방에 붙여 넣으세요.")
+        with vb2:
+            st.link_button("📸 쓰레기가 있었어요 → 제보하기", core.APP_URL + "?go=report", use_container_width=True)
+            vkeeper = (not _secret("ADMIN_CODE")) or bool(st.session_state.get("keeper"))
+            vwho = core.scrub_memo(st.text_input("순찰자 / 메모 (선택, 이름·연락처 쓰지 마세요)", key="v_patrol_who",
+                                                 max_chars=core.MEMO_MAX, placeholder="예: 평대리 주민 모니터링, 흰물떼새 2마리"))
+            if st.button("🧭 둘러봤는데 이상 없어요 (순찰 기록)", use_container_width=True, disabled=not vkeeper):
+                record_patrol(VZONE, vwho, core.stale_points_in_zone(table, zones, VZONE))
+            if not vkeeper:
+                st.caption("순찰 기록은 지킴이 코드가 있어야 해요 (📋 우선 수거 리포트 탭에서 입력).")
+        if st.session_state.get("flash_patrol"):
+            st.success(st.session_state.pop("flash_patrol"))
+elif st.query_params.get("zone"):
+    st.info(f"'{st.query_params.get('zone')}' 구역을 찾지 못했어요. 📋 우선 수거 리포트 탭의 '우리 마을 앞바다'에서 골라 주세요.")
+
 if st.query_params.get("go") == "report":       # 제보용 QR(?go=report)로 들어오면 제보 탭이 맨 앞
     tab_report, tab_map, tab_list, tab_check = st.tabs(
         ["📸 쓰레기 제보", "🗺️ 위험도 지도", "📋 우선 수거 리포트", "🔬 가중치 검증"])
@@ -523,6 +580,18 @@ with tab_list:
     keeper = (not admin_code) or bool(st.session_state.get("keeper"))
     if not keeper:
         st.caption("수거 완료·순찰 기록은 지킴이 코드가 있어야 할 수 있어요. 목록 보기와 CSV 다운로드는 누구나 가능합니다.")
+    if zones:
+        zn = sorted((z["properties"]["name"] for z in zones), key=core.short_zone)
+        zsel = st.selectbox("🏘️ 우리 마을 앞바다 보기 (주소 뒤 ?zone=평대리 처럼 열 수 있어요, 화면 맨 위에 나와요)",
+                            ["선택 안 함"] + zn, index=(zn.index(VZONE) + 1) if VZONE in zn else 0,
+                            format_func=lambda n: n if n == "선택 안 함" else f"{core.short_zone(n)} ({n})", key="view_zone")
+        if zsel != "선택 안 함" and zsel != VZONE:
+            sz = core.short_zone(zsel)                 # 짧은 이름이 겹치면(예: 비양도 #2) 전체 이름으로
+            st.query_params["zone"] = sz if core.find_zone(zones, sz) == zsel else zsel
+            st.rerun()
+        elif zsel == "선택 안 함" and VZONE:
+            del st.query_params["zone"]
+            st.rerun()
     emd_opts = ["전체"] + core.EMD_LIST
     q_emd = st.query_params.get("emd", "")
     view = st.selectbox("📍 담당 읍면동만 보기 (주소 뒤 ?emd= 로 바로 열 수 있어요)", emd_opts,
@@ -682,17 +751,7 @@ with tab_list:
         if clear:
             st.caption("이 구역의 재확인 필요 지점 → 함께 수거 완료 처리: **" + ", ".join(clear) + "**")
         if pz3.button("이상 없음 기록", use_container_width=True, disabled=not keeper):
-            now = now_kst()
-            pid = now.strftime("%Y%m%d%H%M%S%f")
-            logged = now.strftime("%Y-%m-%d %H:%M:%S")
-            persist("patrols", {"zone": pz, "date": TODAY.isoformat(), "by": pwho, "logged": logged,
-                                "id": pid, "cleared": clear})
-            for site in clear:
-                persist("cleanups", {"site": site, "date": TODAY.isoformat(), "logged": logged,
-                                     "by": "순찰 확인(이상 없음)" + (f" · {pwho}" if pwho else ""), "patrol": pid})
-            st.session_state.flash_patrol = (f"🧭 **{pz}** 순찰 확인(이상 없음) 기록됨. 공백 목록에서 빠졌어요."
-                                             + (f" 수거 완료 처리: {', '.join(clear)}" if clear else ""))
-            st.rerun()
+            record_patrol(pz, pwho, clear)
         if st.session_state.get("flash_patrol"):
             st.success(st.session_state.pop("flash_patrol"))
         if st.session_state.patrols:
