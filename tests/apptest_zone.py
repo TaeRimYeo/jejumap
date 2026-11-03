@@ -2,7 +2,7 @@
 from streamlit.testing.v1 import AppTest
 
 def run(q):
-    at = AppTest.from_file("app.py", default_timeout=120)
+    at = AppTest.from_file("../app.py", default_timeout=120)
     for k, v in q.items():
         at.query_params[k] = v
     at.run()
