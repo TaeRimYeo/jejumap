@@ -50,4 +50,14 @@ sel = next(s for s in at.selectbox if s.key == "view_zone")
 sel.set_value("이호동 지선").run()
 assert not at.exception, [e.value for e in at.exception]
 print("select ->", dict(at.query_params))
+# 비 온 뒤 하천 하구: 수동 스위치 → 순찰 필요 안내, 하구 마을 화면에도 안내
+at = run({"zone": "용담동"})
+assert any("한천" in c.value for c in at.caption) or any("한천" in w.value for w in at.warning)
+tg = next(t for t in at.toggle if t.key == "rain_force")
+tg.set_value(True).run()
+assert not at.exception, [e.value for e in at.exception]
+assert any("하천 하구" in w.value and "순찰이 필요" in w.value for w in at.warning), [w.value for w in at.warning]
+assert any("한천" in w.value and "큰비 뒤" in w.value for w in at.warning)
+assert any("하천 하구 순찰" in c.value for c in at.code), "브리핑에 하구 순찰 없음"
+print("rain:", [c.value for c in at.markdown if "최근 3일" in c.value][:2])
 print("ALL OK")

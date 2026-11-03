@@ -30,3 +30,21 @@ assert set(W) == {"평대리 지선", "이호동 지선"}, W
 t = core.apply_wildlife(core.build_table(beaches, r, False, [], today=datetime.date(2026, 11, 4)), zones, W)
 assert (t.wildlife != "").any()
 print("MONITOR OK")
+
+# ---- 비 온 뒤 하천 하구 ----
+T = datetime.date(2026, 11, 4)
+rs = core.rain_summary({"2026-11-02": 20, "2026-11-03": 15, "2026-11-04": 0, "2026-11-05": 5}, T)
+assert rs == {"past3": 35, "tomorrow": 5, "triggered": True}, rs
+assert core.rain_summary(None, T) is None
+t = core.build_table(beaches, [], False, [], today=T)
+cov = core.zone_coverage(t, zones, today=T)
+rv = core.river_patrol(zones, cov, {"북부(제주시)": rs, "남부(서귀포)": None})
+assert all(rv["하구 해안 구역"] != ""), rv
+assert set(rv[rv["순찰"] != "평소"]["강수 지역"]) == {"북부(제주시)"}
+assert rv.iloc[0]["순찰"] != "평소"                      # 순찰 필요한 곳이 먼저
+assert (core.river_patrol(zones, cov, {}, force=True)["순찰"] != "평소").all()
+b = core.briefing_text(t, cov, "제주시 동지역", T, rivers=rv)
+assert "하천 하구 순찰" in b and "한천" in b, b
+live = core.fetch_rain(33.5, 126.53)
+print("live rain:", core.rain_summary(live, datetime.date.today()) if live else "받아오지 못함")
+print("RIVER OK")

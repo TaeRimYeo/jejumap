@@ -938,7 +938,7 @@ def export_geojson(table, today=None):
                        "generated": str(_to_date(today) or _dt.date.today()), "features": feats}, ensure_ascii=False)
 
 
-def briefing_text(table, cov, emd=None, today=None, n=3):
+def briefing_text(table, cov, emd=None, today=None, n=3, rivers=None):
     """읍면동 담당자에게 메신저·공문으로 바로 붙여넣을 주간 브리핑."""
     today = _to_date(today) or _dt.date.today()
     t = table if not emd else table[table.emd == emd]
@@ -962,6 +962,12 @@ def briefing_text(table, cov, emd=None, today=None, n=3):
     sw = t[t.seaweed_mass] if "seaweed_mass" in t else t.iloc[0:0]
     if len(sw):
         lines += ["", "※ 대량 해조류(괭생이모자반 등): 부패 전 신속 수거 – " + ", ".join(sw.name)]
+    if rivers is not None and len(rivers):
+        rv = rivers[rivers["순찰"] != "평소"]
+        if emd:
+            rv = rv[rv["읍면동"].map(zone_emd) == zone_emd(emd)]
+        if len(rv):
+            lines += ["", "🌧️ 큰비 뒤 하천 하구 순찰: " + ", ".join(f"{r['하천']}({short_zone(r['하구 해안 구역'])})" for _, r in rv.iterrows())]
     pend = int(t.unverified.sum()) if "unverified" in t else 0
     if pend:
         lines += ["", f"3) 검토 대기 제보 {pend}묶음 – 출동 전 사진·현장 확인 필요"]
@@ -1224,3 +1230,71 @@ def parse_monitoring(df, beaches, zones, default_org="주민 모니터링"):
                             "by": f"{org}" + (f" · {memo}" if memo else ""), "logged": f"{d.isoformat()} 12:00:00",
                             "id": "mon_" + rid, "cleared": [], "wildlife": wild, "channel": org})
     return patrols, reports, skipped
+
+
+# ---------------- 비 온 뒤 하천 하구 순찰 ----------------
+# 제주 하천은 대부분 평소 물이 없는 건천이라, 큰비가 오면 하천 바닥에 쌓인 쓰레기가 한꺼번에 바다로 내려온다.
+# 큰비 뒤에는 하천 하구가 있는 해안 구역을 먼저 둘러보게 한다. 하구 위치는 지도에서 읽은 근사값.
+RIVER_MOUTHS = [  # (하천, 읍면동, 위도, 경도)
+    ("한천", "제주시 동지역", 33.5158, 126.5135),
+    ("병문천", "제주시 동지역", 33.5178, 126.5203),
+    ("산지천", "제주시 동지역", 33.5183, 126.5268),
+    ("화북천", "제주시 동지역", 33.5222, 126.5686),
+    ("외도천", "제주시 동지역", 33.4952, 126.4372),
+    ("옹포천", "한림읍", 33.3990, 126.2535),
+    ("창고천", "안덕면", 33.2340, 126.3600),
+    ("강정천", "서귀포시 동지역", 33.2255, 126.4790),
+    ("연외천", "서귀포시 동지역", 33.2405, 126.5590),
+    ("효돈천", "서귀포시 동지역", 33.2520, 126.6225),
+    ("천미천", "표선면", 33.3300, 126.8370),
+]
+RAIN_STATIONS = {"북부(제주시)": (33.50, 126.53), "남부(서귀포)": (33.25, 126.56)}
+RAIN_TRIGGER_MM = 30          # 최근 3일 합계 (팀이 정한 기준, 가정값)
+RAIN_URL = ("https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+            "&daily=precipitation_sum&past_days=3&forecast_days=2&timezone=Asia%2FSeoul")
+
+
+def fetch_rain(lat, lon, timeout=6):
+    """Open-Meteo(무료·키 없음) 일 강수량. 반환 {날짜 문자열: mm}. 실패하면 None."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(RAIN_URL.format(lat=lat, lon=lon), timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))["daily"]
+        return {t: float(v or 0) for t, v in zip(d["time"], d["precipitation_sum"])}
+    except Exception:
+        return None
+
+
+def rain_summary(daily, today=None):
+    """{날짜: mm} → 최근 3일(오늘 포함 이전 3일) 합계와 내일 예보."""
+    today = _to_date(today) or _dt.date.today()
+    if not daily:
+        return None
+    past = sum(v for k, v in daily.items() if 0 <= (today - _to_date(k)).days <= 2)
+    nxt = sum(v for k, v in daily.items() if (_to_date(k) - today).days == 1)
+    return {"past3": round(past, 1), "tomorrow": round(nxt, 1), "triggered": past >= RAIN_TRIGGER_MM}
+
+
+def station_of(lat):
+    return "북부(제주시)" if lat >= 33.36 else "남부(서귀포)"
+
+
+def river_patrol(zones, cov, rain, force=False):
+    """하구별 순찰 목록. rain = {관측지점: rain_summary 결과 또는 None}. force=True면 큰비로 간주(시연·수동)."""
+    rows = []
+    state = dict(zip(cov.zone, cov.state)) if cov is not None else {}
+    last = dict(zip(cov.zone, cov.last_check)) if cov is not None else {}
+    for name, emd, lat, lon in RIVER_MOUTHS:
+        zi = nearest_zone(zones, lat, lon) if zones else None
+        zname = zones[zi]["properties"]["name"] if zi is not None else ""
+        st_name = station_of(lat)
+        rs = (rain or {}).get(st_name)
+        trig = force or bool(rs and rs["triggered"])
+        rows.append({"하천": name, "하구 해안 구역": zname, "읍면동": emd, "강수 지역": st_name,
+                     "최근 3일 비(mm)": rs["past3"] if rs else None, "내일 예보(mm)": rs["tomorrow"] if rs else None,
+                     "구역 상태": state.get(zname, ""), "마지막 확인": last.get(zname, ""),
+                     "순찰": "🌧️ 비 온 뒤 순찰 필요" if trig else "평소", "lat": lat, "lon": lon})
+    df = pd.DataFrame(rows)
+    df["_t"] = df["순찰"] != "평소"
+    df = df.sort_values(["_t", "최근 3일 비(mm)"], ascending=[False, False], na_position="last")
+    return df.drop(columns="_t").reset_index(drop=True)

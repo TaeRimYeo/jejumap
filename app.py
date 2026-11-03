@@ -250,6 +250,22 @@ table = core.apply_wildlife(core.build_table(beaches, REPORTS, winter, records,
 cov = (core.zone_coverage(table, zones, winter, today=TODAY, cleanups=st.session_state.cleanups,
                           patrols=st.session_state.patrols, wild=WILD) if zones else None)
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_rain(day):            # 한 시간에 한 번만 (무료 API 부담 줄이기). 실패는 캐시하지 않음
+    out = {k: core.rain_summary(core.fetch_rain(*ll), day) for k, ll in core.RAIN_STATIONS.items()}
+    if not any(out.values()):
+        raise RuntimeError("rain unavailable")
+    return out
+
+
+try:
+    RAIN = load_rain(TODAY.isoformat())
+except Exception:
+    RAIN = {k: None for k in core.RAIN_STATIONS}
+RAIN_FORCE = bool(st.session_state.get("rain_force"))
+RIVERS = core.river_patrol(zones, cov, RAIN, force=RAIN_FORCE) if zones else None
+
+
 def record_patrol(pz, pwho, clear, wildlife=None):
     """순찰 '이상 없음' 기록 (+ 구역 안 재확인 지점은 수거 완료 처리, 관찰한 생물)."""
     wildlife = [w for w in (wildlife or []) if w in core.WILDLIFE]
@@ -294,6 +310,14 @@ if VZONE and cov is not None:
         v4.metric("이 앞바다 지점", len(zpts))
         if zrow["state"] != "최근 확인":
             st.warning("기록이 없다는 건 깨끗하다는 뜻이 아니라 **모른다**는 뜻이에요. 한 번 둘러보고 아래에 남겨 주세요.")
+        zr = RIVERS[RIVERS["하구 해안 구역"] == VZONE] if RIVERS is not None else None
+        if zr is not None and len(zr):
+            trig = zr[zr["순찰"] != "평소"]
+            names = ", ".join(zr["하천"])
+            (st.warning if len(trig) else st.caption)(
+                f"🌧️ 이 앞바다에는 **{names}** 하구가 있어요. " +
+                ("큰비 뒤라 하천에서 쓰레기가 내려왔을 수 있어요. 오늘 둘러봐 주세요." if len(trig)
+                 else f"최근 3일 비가 {core.RAIN_TRIGGER_MM}mm를 넘으면 먼저 둘러볼 곳이에요."))
         if zrow.get("wildlife"):
             st.success(f"🐢 최근 1년 관찰한 생물: **{zrow['wildlife']}** — 생물이 사는 곳으로 보고 위험 지수·순찰 순서를 "
                        f"{core.WILDLIFE_BONUS}배로 봐요.")
@@ -421,6 +445,12 @@ with tab_map:
         folium.CircleMarker([r.lat, r.lon], radius=size, color=src, weight=3,
                             fill=True, fill_color=color_for(score, r.status), fill_opacity=0.85,
                             tooltip=tip, popup=folium.Popup(pop, max_width=280)).add_to(m)
+    if RIVERS is not None:
+        for _, rr in RIVERS.iterrows():
+            trig = rr["순찰"] != "평소"
+            folium.Marker([rr["lat"], rr["lon"]], tooltip=f"{rr['하천']} 하구" + (" · 🌧️ 비 온 뒤 순찰 필요" if trig else ""),
+                          icon=folium.DivIcon(html=f"<div style='font-size:{18 if trig else 13}px'>{'🌧️' if trig else '💧'}</div>")
+                          ).add_to(m)
     st_folium(m, height=520, use_container_width=True, returned_objects=[])
     st.caption("● 채움색: 빨강 높음(4.5+) · 주황 보통(3–4.5) · 초록 낮음 · **회보라 오래된 근거(재확인 필요)** · "
                "흰색 수거 완료 · 회색 확인 기록 없음　| 크기: 근거 수　"
@@ -658,7 +688,7 @@ with tab_list:
     st.divider()
     st.markdown("#### 🔗 기존 업무로 보내기 (새 앱을 또 쓰지 않아도 되게)")
     st.caption("담당자는 이 앱을 매일 열 필요 없이, 아래 브리핑을 메신저·공문에 붙여 넣거나 파일을 기존 시스템에 올리면 됩니다.")
-    brief = core.briefing_text(table, cov, vemd, TODAY)
+    brief = core.briefing_text(table, cov, vemd, TODAY, rivers=RIVERS)
     b1, b2 = st.columns([3, 2])
     with b1:
         st.code(brief, language=None)
@@ -846,6 +876,23 @@ with tab_list:
     stale = table[table.status.str.contains("재확인")].sort_values("potential", ascending=False)
     if len(stale):
         st.divider()
+        st.markdown("#### 🌧️ 비 온 뒤 하천 하구 순찰")
+        st.caption("제주 하천은 대부분 평소 물이 없는 건천이라, 큰비가 오면 하천에 쌓인 쓰레기가 한꺼번에 바다로 내려옵니다. "
+                   f"최근 3일 비가 **{core.RAIN_TRIGGER_MM}mm 이상**(팀이 정한 기준)이면 하구가 있는 해안 구역을 먼저 둘러보세요. "
+                   "강수량: Open-Meteo(무료) 북부·남부 2곳, 하구 위치는 근사값.")
+        if RIVERS is not None:
+            ok = [v for v in RAIN.values() if v]
+            if not ok:
+                st.info("지금은 강수량을 받아오지 못했어요. 큰비가 온 뒤라면 아래 스위치를 켜서 순찰 목록을 쓰세요.")
+            else:
+                st.write(" · ".join(f"**{k}** 최근 3일 {v['past3']}mm, 내일 예보 {v['tomorrow']}mm" for k, v in RAIN.items() if v))
+            st.toggle("큰비가 온 것으로 보기 (수동 · 시연용)", key="rain_force")
+            rv = RIVERS.drop(columns=["lat", "lon"])
+            n_trig = int((rv["순찰"] != "평소").sum())
+            if n_trig:
+                st.warning(f"🌧️ 하천 하구 **{n_trig}곳** 순찰이 필요해요. 위 🧭 순찰 기록에서 해당 구역을 골라 남겨 주세요.")
+            st.dataframe(rv, hide_index=True, use_container_width=True)
+
         st.markdown("#### 🔎 재확인 권장 지점 (예전에 쓰레기가 확인된 곳)")
         sv = stale[["name", "emd", "status", "potential", "last_date", "last_cleanup"]].copy()
         if zones:
